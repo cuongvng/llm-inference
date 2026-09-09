@@ -18,6 +18,7 @@ set(LLM_CUDA_ARCH "86" CACHE STRING "CUDA compute capability to target (no dot)"
 set(CMAKE_CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)  # dev-time only: builds test fixtures / offline conversion
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)

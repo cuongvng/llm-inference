@@ -1,0 +1,7 @@
+# Dev-time only (PLAN.md / DESIGN_QA.md): never a runtime dependency of the
+# C++ engine. Needed only to run convert_weights.py / tokenize_prompts.py /
+# reference_forward.py against a real HuggingFace checkpoint.
+torch>=2.1
+transformers>=4.38
+safetensors>=0.4
+numpy>=1.24
