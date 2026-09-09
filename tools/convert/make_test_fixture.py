@@ -1,7 +1,6 @@
 """Build a tiny synthetic model file for engine/tests/test_loader.cu.
 
-M1's done signal is "embedding row byte-matches Python source for a given
-token id" -- this script is that Python source. It writes:
+Outputs:
   - <out_dir>/tiny_model.llmbin   the model file, loaded by the C++ test
   - <out_dir>/expected_row.bin    raw fp16 bytes of the embedding row for
                                   TOKEN_ID, for a byte-exact memcmp in C++
