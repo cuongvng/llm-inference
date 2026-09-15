@@ -1,12 +1,97 @@
 #pragma once
 
+#include <cuda_fp16.h>
+
 #include <cstddef>
+#include <cstdint>
 
 namespace llm {
+
+// Launch wrappers for every hand-written kernel. One declaration per operator;
+// the kernel itself and its launch configuration live in engine/kernels/*.cu.
+//
+// Conventions across all of these:
+//   * Weights live in VRAM as FP16 (`__half`) exactly as the .llmbin file
+//     stores them, and are converted to FP32 on read inside the consuming
+//     kernel -- never materialized as an FP32 copy in global memory.
+//   * Activations are FP32. This is the naive baseline: it keeps the
+//     accumulate path obvious and makes reference comparisons about kernel
+//     correctness rather than about half-precision rounding. Narrowing
+//     activations is a later, measured change.
+//   * `stream` is a `cudaStream_t` passed as `void*` so this header stays
+//     includable from plain C++ translation units; nullptr means the default
+//     stream.
+//   * Every wrapper checks the launch for errors but does not synchronize --
+//     the caller decides where the pipeline drains.
 
 // Toolchain smoke test: c[i] = a[i] + b[i] over device pointers.
 // Grid-stride loop so the launch config is independent of `n`.
 void launch_vector_add(const float* d_a, const float* d_b, float* d_c, std::size_t n,
                        void* stream = nullptr);
+
+// out[t, :] = table[ids[t], :]   -- table is [vocab, hidden], out is [n_tokens, hidden].
+void launch_embedding_lookup(const __half* table, const std::int32_t* ids, float* out,
+                             int n_tokens, int hidden, void* stream = nullptr);
+
+// Row-wise RMS norm: out[r, :] = x[r, :] * rsqrt(mean(x[r, :]^2) + eps) * weight.
+// `x` and `out` are [n_rows, hidden]; `weight` is [hidden]. In-place (out == x)
+// is allowed.
+void launch_rmsnorm(const float* x, const __half* weight, float* out, int n_rows, int hidden,
+                    float eps, void* stream = nullptr);
+
+// Rotary position embedding, applied in place to both q [n_tokens, n_heads, head_dim]
+// and k [n_tokens, n_kv_heads, head_dim]. `positions` is one absolute position
+// per token (not assumed to be 0..n_tokens-1: a cached decode step passes the
+// real position). Pairing is Llama's rotate_half -- element i rotates with
+// element i + head_dim/2 -- which is what the HuggingFace checkpoints this
+// engine converts are trained with.
+void launch_rope(float* q, float* k, const std::int32_t* positions, int n_tokens, int n_heads,
+                 int n_kv_heads, int head_dim, float theta, void* stream = nullptr);
+
+// y[n] = sum_k weight[n, k] * x[k]. Weight is row-major [n_out, k_in], i.e. the
+// same orientation HuggingFace stores a Linear in, so no transpose pass is
+// needed at load time.
+void launch_gemv_fp16(const __half* weight, const float* x, float* y, int n_out, int k_in,
+                      void* stream = nullptr);
+
+// y[m, n] = sum_k x[m, k] * weight[n, k]. Same weight orientation as the GEMV;
+// `x` is [m_rows, k_in] and `y` is [m_rows, n_out].
+void launch_gemm_fp16(const __half* weight, const float* x, float* y, int m_rows, int n_out,
+                      int k_in, void* stream = nullptr);
+
+// scores[h, i, j] = dot(q[i, h, :], k[j, kv_head(h), :]) / sqrt(head_dim),
+// with -inf written wherever key j is in the future of query i. A query at row
+// i has absolute position `query_pos_offset + i`, so a full-sequence prefill
+// passes 0 and a single decode step passes the token's position -- the same
+// kernel serves both.
+//
+// GQA: kv_head(h) = h / (n_heads / n_kv_heads).
+// q is [n_query, n_heads, head_dim], k is [n_keys, n_kv_heads, head_dim],
+// scores is [n_heads, n_query, n_keys].
+void launch_attention_qk(const float* q, const float* k, float* scores, int n_query, int n_keys,
+                         int n_heads, int n_kv_heads, int head_dim, int query_pos_offset,
+                         void* stream = nullptr);
+
+// In-place softmax over the last dimension of an [n_rows, row_len] array.
+// Entries masked to -inf by attention_qk must come out as exactly 0.
+void launch_softmax_rows(float* x, int n_rows, int row_len, void* stream = nullptr);
+
+// out[i, h, :] = sum_j probs[h, i, j] * v[j, kv_head(h), :].
+// probs is [n_heads, n_query, n_keys], v is [n_keys, n_kv_heads, head_dim],
+// out is [n_query, n_heads, head_dim].
+void launch_attention_av(const float* probs, const float* v, float* out, int n_query, int n_keys,
+                         int n_heads, int n_kv_heads, int head_dim, void* stream = nullptr);
+
+// out[i] = silu(gate[i]) * up[i], where silu(z) = z * sigmoid(z).
+void launch_swiglu(const float* gate, const float* up, float* out, std::size_t n,
+                   void* stream = nullptr);
+
+// x[i] += y[i], in place.
+void launch_residual_add(float* x, const float* y, std::size_t n, void* stream = nullptr);
+
+// *out_index = argmax_i logits[i], ties resolved to the lowest index (matching
+// torch.argmax, so the greedy-decode comparison is exact rather than
+// approximate).
+void launch_argmax(const float* logits, std::int32_t* out_index, int n, void* stream = nullptr);
 
 }  // namespace llm
