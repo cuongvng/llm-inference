@@ -256,7 +256,7 @@ std::int32_t Model::argmax_last(int n_tokens) {
 }
 
 std::vector<std::int32_t> Model::generate(const std::vector<std::int32_t>& prompt,
-                                          int max_new_tokens) {
+                                          int max_new_tokens, const TokenCallback& on_token) {
   if (prompt.empty()) fail("generate called with an empty prompt");
 
   std::vector<std::int32_t> sequence = prompt;
@@ -272,6 +272,7 @@ std::vector<std::int32_t> Model::generate(const std::vector<std::int32_t>& promp
     const std::int32_t next = argmax_last(static_cast<int>(sequence.size()));
     generated.push_back(next);
     sequence.push_back(next);
+    if (on_token) on_token(step, next);
   }
   return generated;
 }

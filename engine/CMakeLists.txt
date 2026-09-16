@@ -1,10 +1,27 @@
 add_library(llm_engine
   src/device_info.cu
   src/loader.cpp
+  src/model.cpp
   kernels/vector_add.cu
+  kernels/embedding_lookup.cu
+  kernels/rmsnorm.cu
+  kernels/rope.cu
+  kernels/gemv_fp16.cu
+  kernels/gemm_fp16.cu
+  kernels/attention_qk.cu
+  kernels/softmax.cu
+  kernels/attention_av.cu
+  kernels/swiglu.cu
+  kernels/residual_add.cu
+  kernels/logits_argmax.cu
 )
 
-target_include_directories(llm_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(llm_engine
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  # kernels.cuh is an implementation detail shared between the .cu files, not
+  # part of the engine's interface.
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels
+)
 target_link_libraries(llm_engine PUBLIC CUDA::cudart)
 target_compile_definitions(llm_engine PUBLIC LLM_BUILD_SM=${LLM_CUDA_ARCH})
 set_target_properties(llm_engine PROPERTIES
@@ -45,7 +62,7 @@ add_custom_command(
   COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/make_test_fixture.py ${LLM_FIXTURE_DIR}
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/make_test_fixture.py
           ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/binformat.py
-  COMMENT "Generating M1 loader test fixture from tools/convert/make_test_fixture.py"
+  COMMENT "Generating loader test fixture from tools/convert/make_test_fixture.py"
 )
 add_custom_target(llm_loader_test_fixture DEPENDS ${LLM_FIXTURE_MODEL} ${LLM_FIXTURE_EXPECTED_ROW})
 
@@ -55,3 +72,92 @@ add_dependencies(test_loader llm_loader_test_fixture)
 set_target_properties(test_loader PROPERTIES CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
 add_test(NAME test_loader COMMAND test_loader ${LLM_FIXTURE_MODEL} ${LLM_FIXTURE_EXPECTED_ROW})
 set_tests_properties(test_loader PROPERTIES TIMEOUT 120)
+
+
+# Reference fixtures for the kernel and forward-pass tests: one torch run,
+# written out as .llmbin files, regenerated whenever the reference math changes.
+# Requires the dev-time Python stack (tools/convert/requirements.txt); without
+# it, configure with -DLLM_BUILD_REFERENCE_TESTS=OFF and the rest still builds.
+option(LLM_BUILD_REFERENCE_TESTS "Build the tests that compare kernels against the torch reference" ON)
+
+# The interpreter that runs the reference is a separate knob from the one that
+# builds the stdlib-only loader fixture: the reference needs torch, which
+# usually lives in a virtualenv or conda env rather than in the system python
+# CMake finds first.
+#   cmake -B build -DLLM_REFERENCE_PYTHON=/path/to/env/bin/python
+set(LLM_REFERENCE_PYTHON ${Python3_EXECUTABLE} CACHE FILEPATH
+    "Python interpreter with torch/numpy installed, for the reference fixtures")
+
+if(LLM_BUILD_REFERENCE_TESTS)
+  # Checked here rather than at build time so a missing torch is a clear
+  # configure-time message, not a failed build with a traceback in it.
+  execute_process(
+    COMMAND ${LLM_REFERENCE_PYTHON} -c "import torch, numpy"
+    RESULT_VARIABLE LLM_REFERENCE_PYTHON_OK
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT LLM_REFERENCE_PYTHON_OK EQUAL 0)
+    message(WARNING
+      "Reference tests disabled: ${LLM_REFERENCE_PYTHON} has no torch/numpy. "
+      "Install tools/convert/requirements.txt, or point -DLLM_REFERENCE_PYTHON= at an "
+      "interpreter that has them.")
+    set(LLM_BUILD_REFERENCE_TESTS OFF)
+  endif()
+endif()
+
+if(LLM_BUILD_REFERENCE_TESTS)
+  set(LLM_REF_DIR ${CMAKE_CURRENT_BINARY_DIR}/reference)
+
+  # Kernel test name -> the fixture file it consumes.
+  set(LLM_REF_TESTS
+    test_embedding_lookup:ref_embedding.llmbin
+    test_rmsnorm:ref_rmsnorm.llmbin
+    test_rope:ref_rope.llmbin
+    test_gemv_fp16:ref_gemv.llmbin
+    test_gemm_fp16:ref_gemm.llmbin
+    test_attention:ref_attention.llmbin
+    test_elementwise:ref_elementwise.llmbin
+  )
+
+  set(LLM_REF_OUTPUTS "")
+  foreach(entry IN LISTS LLM_REF_TESTS)
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 1 fixture_file)
+    list(APPEND LLM_REF_OUTPUTS ${LLM_REF_DIR}/${fixture_file})
+  endforeach()
+  list(APPEND LLM_REF_OUTPUTS ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin)
+
+  add_custom_command(
+    OUTPUT ${LLM_REF_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${LLM_REF_DIR}
+    COMMAND ${LLM_REFERENCE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/references/reference_forward.py ${LLM_REF_DIR}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/references/reference_forward.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/binformat.py
+    COMMENT "Generating torch reference fixtures from tools/references/reference_forward.py"
+  )
+  add_custom_target(llm_reference_fixtures DEPENDS ${LLM_REF_OUTPUTS})
+
+  foreach(entry IN LISTS LLM_REF_TESTS)
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 0 test_name)
+    list(GET parts 1 fixture_file)
+
+    add_executable(${test_name} tests/${test_name}.cu)
+    target_link_libraries(${test_name} PRIVATE llm_engine)
+    target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_dependencies(${test_name} llm_reference_fixtures)
+    set_target_properties(${test_name} PROPERTIES CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
+    add_test(NAME ${test_name} COMMAND ${test_name} ${LLM_REF_DIR}/${fixture_file})
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+  endforeach()
+
+  # The end-to-end test takes two fixtures: the model, loaded through the same
+  # path a real checkpoint uses, and the reference outputs for it.
+  add_executable(test_forward tests/test_forward.cu)
+  target_link_libraries(test_forward PRIVATE llm_engine)
+  target_include_directories(test_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  add_dependencies(test_forward llm_reference_fixtures)
+  set_target_properties(test_forward PROPERTIES CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
+  add_test(NAME test_forward
+           COMMAND test_forward ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin)
+  set_tests_properties(test_forward PROPERTIES TIMEOUT 300)
+endif()

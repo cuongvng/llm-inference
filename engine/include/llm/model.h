@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -86,9 +87,15 @@ class Model {
   // Argmax over the final position's logits, on the device. Synchronizes.
   std::int32_t argmax_last(int n_tokens);
 
+  // Called once per generated token, as soon as its id is on the host. `step` is
+  // 0 for the first token. This is the streaming seam: a benchmark timestamps
+  // it, and a future server would flush the token to the client from here.
+  using TokenCallback = std::function<void(int step, std::int32_t token)>;
+
   // Greedy decode: repeatedly forward the whole sequence and append the argmax.
   // Returns only the newly generated ids.
-  std::vector<std::int32_t> generate(const std::vector<std::int32_t>& prompt, int max_new_tokens);
+  std::vector<std::int32_t> generate(const std::vector<std::int32_t>& prompt, int max_new_tokens,
+                                     const TokenCallback& on_token = nullptr);
 
  private:
   ModelConfig config_;
