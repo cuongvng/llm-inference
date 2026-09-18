@@ -1,10 +1,12 @@
 #include "llm/model.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
 #include "llm/cuda_check.h"
 #include "llm/kernels.h"
+#include "llm/profile.h"
 
 namespace llm {
 namespace {
@@ -32,6 +34,128 @@ void check_tensor(const std::string& name, const TensorView& t, std::size_t expe
     fail("tensor '" + name + "' has " + std::to_string(elems) + " elements, expected " +
          std::to_string(expect_elems));
   }
+}
+
+// Analytic cost models for the kernel profiler.
+//
+// `ideal` is the compulsory traffic: every distinct input read once, every
+// output written once -- what a perfect implementation of the operator would
+// move. `moved` is what this implementation's blocking actually asks the memory
+// system for. Where the two differ, the difference is re-read, and the ratio is
+// the first thing to look at when a kernel is slower than its bytes suggest.
+//
+// Activations are FP32 and weights FP16 throughout.
+constexpr double kF32 = 4.0;
+constexpr double kF16 = 2.0;
+
+struct Cost {
+  double flops = 0.0;
+  double ideal = 0.0;
+  double moved = 0.0;
+  double dram = 0.0;
+};
+
+// An operand read `factor` times costs DRAM bandwidth only if it is too big for
+// L2 to hold between those reads. This is the one place a cache is modelled at
+// all, and it is what separates "the tiling asks for 110 GB/s" from "the memory
+// bus actually carries 35 GB/s".
+double dram_term(double bytes, double factor) {
+  return bytes <= l2_cache_bytes() ? bytes : bytes * factor;
+}
+
+Cost embedding_cost(int tokens, int hidden) {
+  const double n = static_cast<double>(tokens) * hidden;
+  // Distinct rows of a table far larger than L2: every gathered byte is a miss.
+  return {0.0, n * (kF16 + kF32), n * (kF16 + kF32), n * (kF16 + kF32)};
+}
+
+Cost rmsnorm_cost(int rows, int hidden) {
+  const double n = static_cast<double>(rows) * hidden;
+  // Square-and-accumulate, then scale by the norm and by the weight.
+  // The second pass over the row is a re-read at request level even though a
+  // row this small is served from L1 in practice.
+  const double ideal = 2.0 * n * kF32 + hidden * kF16;
+  return {4.0 * n, ideal, 3.0 * n * kF32 + hidden * kF16, ideal};
+}
+
+Cost rope_cost(int tokens, int q_dim, int kv_dim) {
+  const double n = static_cast<double>(tokens) * (q_dim + kv_dim);
+  // Each rotated pair is 4 multiplies and 2 adds; the sin/cos are not counted.
+  return {3.0 * n, 2.0 * n * kF32, 2.0 * n * kF32, 2.0 * n * kF32};
+}
+
+Cost gemm_cost(int m, int n, int k) {
+  constexpr double kTile = 16.0;
+  const double M = m, N = n, K = k;
+  const double tiles_m = std::ceil(M / kTile);
+  const double tiles_n = std::ceil(N / kTile);
+  Cost c;
+  c.flops = 2.0 * M * N * K;
+  c.ideal = N * K * kF16 + M * K * kF32 + M * N * kF32;
+  // Every output tile stages its own 16 rows of x and 16 rows of the weight
+  // across the whole of k, so the weight matrix is re-read once per row-tile of
+  // m. That factor -- ceil(m / 16) -- is why a longer sequence costs more per
+  // token here than the FLOP count alone predicts.
+  c.moved = tiles_m * tiles_n * kTile * K * (kF32 + kF16) + M * N * kF32;
+  // The weight matrix is megabytes and is re-read once per row-tile: all of
+  // that crosses the bus. The x tile is a few hundred KB at these sequence
+  // lengths, so its tiles_n re-reads are served by L2.
+  c.dram = dram_term(N * K * kF16, tiles_m) + dram_term(M * K * kF32, tiles_n) + M * N * kF32;
+  return c;
+}
+
+Cost attention_qk_cost(int tokens, int heads, int kv_heads, int head_dim) {
+  const double h = heads, t = tokens, d = head_dim;
+  // Causal masking leaves half the score matrix live; the masked half costs a
+  // store and no arithmetic.
+  const double live = h * t * (t + 1.0) / 2.0;
+  Cost c;
+  c.flops = 2.0 * d * live;
+  c.ideal = t * h * d * kF32 + t * kv_heads * d * kF32 + h * t * t * kF32;
+  // One block per (query, head) stages its query once and streams the keys it
+  // is allowed to see, so K is re-read once per query row.
+  c.moved = h * t * d * kF32 + live * d * kF32 + h * t * t * kF32;
+  c.dram = h * t * d * kF32 + dram_term(t * kv_heads * d * kF32, live / t) + h * t * t * kF32;
+  return c;
+}
+
+Cost softmax_cost(int rows, int row_len) {
+  const double n = static_cast<double>(rows) * row_len;
+  // Three passes -- max, exp-sum, normalize -- so four row-sized accesses.
+  return {4.0 * n, 2.0 * n * kF32, 4.0 * n * kF32, 2.0 * n * kF32};
+}
+
+Cost attention_av_cost(int tokens, int heads, int kv_heads, int head_dim) {
+  const double h = heads, t = tokens, d = head_dim;
+  Cost c;
+  // Masked keys carry probability 0 but are still multiplied through, so the
+  // full rectangle is executed.
+  c.flops = 2.0 * h * t * t * d;
+  c.ideal = h * t * t * kF32 + t * kv_heads * d * kF32 + t * h * d * kF32;
+  // The probability row broadcasts across the block; V is re-read in full by
+  // every (query, head) block.
+  c.moved = h * t * t * kF32 + h * t * t * d * kF32 + t * h * d * kF32;
+  c.dram = h * t * t * kF32 + dram_term(t * kv_heads * d * kF32, h * t) + t * h * d * kF32;
+  return c;
+}
+
+Cost swiglu_cost(std::size_t n) {
+  const double e = static_cast<double>(n);
+  return {5.0 * e, 3.0 * e * kF32, 3.0 * e * kF32, 3.0 * e * kF32};
+}
+
+Cost residual_cost(std::size_t n) {
+  const double e = static_cast<double>(n);
+  return {e, 3.0 * e * kF32, 3.0 * e * kF32, 3.0 * e * kF32};
+}
+
+Cost argmax_cost(int n) {
+  const double e = static_cast<double>(n);
+  return {0.0, e * kF32, e * kF32, e * kF32};
+}
+
+void profile_begin_cost(const char* name, const Cost& c) {
+  profile_begin(name, c.flops, c.ideal, c.moved, c.dram);
 }
 
 }  // namespace
@@ -197,43 +321,100 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
 
   // The layer graph. Every step is a launch from llm/kernels.h -- no allocation,
   // no host round trip, nothing between the launches.
+  //
+  // The profile_begin/profile_end pairs are inert unless the profiler is
+  // enabled. Each names a region of the graph rather than a single launch, so
+  // the q/k/v projections (identical shapes, launched back to back) report as
+  // one line.
+  profile_begin_cost("embedding", embedding_cost(n_tokens, hidden));
   launch_embedding_lookup(tok_embeddings_, d_ids, x, n_tokens, hidden);
+  profile_end();
 
   for (const LayerWeights& layer : layers_) {
     // Writes to a separate buffer, not back over x: the residual add below
     // needs the un-normed stream.
+    profile_begin_cost("rmsnorm", rmsnorm_cost(n_tokens, hidden));
     launch_rmsnorm(x, layer.attn_norm, normed, n_tokens, hidden, eps);
+    profile_end();
 
+    Cost qkv = gemm_cost(n_tokens, q_dim(), hidden);
+    const Cost kv_one = gemm_cost(n_tokens, kv_dim(), hidden);
+    qkv.flops += 2.0 * kv_one.flops;
+    qkv.ideal += 2.0 * kv_one.ideal;
+    qkv.moved += 2.0 * kv_one.moved;
+    qkv.dram += 2.0 * kv_one.dram;
+    profile_begin_cost("gemm.qkv", qkv);
     launch_gemm_fp16(layer.wq, normed, q, n_tokens, q_dim(), hidden);
     launch_gemm_fp16(layer.wk, normed, k, n_tokens, kv_dim(), hidden);
     launch_gemm_fp16(layer.wv, normed, v, n_tokens, kv_dim(), hidden);
+    profile_end();
 
+    profile_begin_cost("rope", rope_cost(n_tokens, q_dim(), kv_dim()));
     launch_rope(q, k, d_positions, n_tokens, heads, kv_heads, head_dim, config_.rope_theta);
+    profile_end();
 
+    profile_begin_cost("attn.qk", attention_qk_cost(n_tokens, heads, kv_heads, head_dim));
     launch_attention_qk(q, k, scores, n_tokens, n_tokens, heads, kv_heads, head_dim,
                         /*query_pos_offset=*/0);
+    profile_end();
+
     // The score matrix is heads * n_tokens independent rows of length n_tokens;
     // the causal mask is already baked into it as -inf.
+    profile_begin_cost("attn.softmax", softmax_cost(heads * n_tokens, n_tokens));
     launch_softmax_rows(scores, heads * n_tokens, n_tokens);
+    profile_end();
+
+    profile_begin_cost("attn.av", attention_av_cost(n_tokens, heads, kv_heads, head_dim));
     launch_attention_av(scores, v, attn_out, n_tokens, n_tokens, heads, kv_heads, head_dim);
+    profile_end();
 
+    profile_begin_cost("gemm.wo", gemm_cost(n_tokens, hidden, q_dim()));
     launch_gemm_fp16(layer.wo, attn_out, proj, n_tokens, hidden, q_dim());
-    launch_residual_add(x, proj, hidden_elems);
+    profile_end();
 
+    profile_begin_cost("residual", residual_cost(hidden_elems));
+    launch_residual_add(x, proj, hidden_elems);
+    profile_end();
+
+    profile_begin_cost("rmsnorm", rmsnorm_cost(n_tokens, hidden));
     launch_rmsnorm(x, layer.ffn_norm, normed, n_tokens, hidden, eps);
+    profile_end();
+
+    Cost gate_up = gemm_cost(n_tokens, inter, hidden);
+    gate_up.flops *= 2.0;
+    gate_up.ideal *= 2.0;
+    gate_up.moved *= 2.0;
+    gate_up.dram *= 2.0;
+    profile_begin_cost("gemm.gate_up", gate_up);
     launch_gemm_fp16(layer.gate_proj, normed, gate, n_tokens, inter, hidden);
     launch_gemm_fp16(layer.up_proj, normed, up, n_tokens, inter, hidden);
+    profile_end();
+
+    profile_begin_cost("swiglu", swiglu_cost(static_cast<std::size_t>(n_tokens) * inter));
     launch_swiglu(gate, up, activated, static_cast<std::size_t>(n_tokens) * inter);
+    profile_end();
+
+    profile_begin_cost("gemm.down", gemm_cost(n_tokens, hidden, inter));
     launch_gemm_fp16(layer.down_proj, activated, proj, n_tokens, hidden, inter);
+    profile_end();
+
+    profile_begin_cost("residual", residual_cost(hidden_elems));
     launch_residual_add(x, proj, hidden_elems);
+    profile_end();
   }
 
+  profile_begin_cost("rmsnorm", rmsnorm_cost(n_tokens, hidden));
   launch_rmsnorm(x, output_norm_, normed, n_tokens, hidden, eps);
+  profile_end();
+
   // Logits for every position, not just the last: the reference checks all of
   // them, which localizes a failure the token ids alone would report as one
   // wrong number. With a KV cache only the final row needs computing.
+  profile_begin_cost("gemm.lm_head",
+                     gemm_cost(n_tokens, static_cast<int>(config_.vocab_size), hidden));
   launch_gemm_fp16(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size),
                    hidden);
+  profile_end();
 }
 
 std::vector<float> Model::logits_host(int n_tokens) {
@@ -247,8 +428,10 @@ std::vector<float> Model::logits_host(int n_tokens) {
 std::int32_t Model::argmax_last(int n_tokens) {
   const float* last_row =
       act_.logits.as<float>() + static_cast<std::size_t>(n_tokens - 1) * config_.vocab_size;
+  profile_begin_cost("argmax", argmax_cost(static_cast<int>(config_.vocab_size)));
   launch_argmax(last_row, act_.next_token.as<std::int32_t>(),
                 static_cast<int>(config_.vocab_size));
+  profile_end();
   std::int32_t token = -1;
   LLM_CUDA_CHECK(cudaDeviceSynchronize());
   act_.next_token.download(&token, sizeof(token));

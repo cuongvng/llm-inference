@@ -16,6 +16,12 @@
 //   TPS   decode throughput, (tokens - 1) / (E2E - TTFT), so prefill doesn't
 //         dilute it; plus the end-to-end rate tokens / E2E for reference.
 //
+// With --kernels, one extra request runs with CUDA-event timing around every
+// region of the layer graph, and the per-kernel table underneath answers the
+// question the request metrics raise but cannot settle: which operator the time
+// is in, and whether that operator is near the machine's limits or far from
+// them.
+//
 // Model load (disk read + VRAM upload) is timed separately and excluded from
 // every request metric -- it happens once per process, not once per request.
 
@@ -32,6 +38,7 @@
 
 #include "llm/cuda_check.h"
 #include "llm/model.h"
+#include "llm/profile.h"
 
 namespace {
 
@@ -123,6 +130,77 @@ RunResult run_request(llm::Model& model, const std::vector<std::int32_t>& prompt
   return r;
 }
 
+// Peak numbers for the installed device, used only as roofline denominators.
+struct DevicePeaks {
+  double bandwidth_gbps = 0.0;
+  double fp32_gflops = 0.0;
+};
+
+DevicePeaks device_peaks() {
+  cudaDeviceProp prop{};
+  int device = 0;
+  LLM_CUDA_CHECK(cudaGetDevice(&device));
+  LLM_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  DevicePeaks p;
+  // DDR: two transfers per memory clock.
+  p.bandwidth_gbps = 2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8.0) / 1e9;
+  // 128 FP32 lanes per SM on Ampere consumer parts, one FMA (2 flops) per lane
+  // per clock. This is the no-tensor-core peak, which is the right ceiling for
+  // kernels written in plain CUDA C. clockRate is the reported clock, not the
+  // boost clock the part may actually run at, so the "% of peak" figures this
+  // feeds are upper bounds.
+  p.fp32_gflops = prop.multiProcessorCount * 128.0 * 2.0 * prop.clockRate * 1e3 / 1e9;
+  return p;
+}
+
+void print_kernel_report(llm::Model& model, const std::vector<std::int32_t>& prompt, int tokens) {
+  llm::KernelProfiler& profiler = llm::KernelProfiler::get();
+  profiler.reset();
+  profiler.enable(true);
+  const Clock::time_point start = Clock::now();
+  const RunResult profiled = run_request(model, prompt, tokens);
+  const double wall_ms = ms_between(start, Clock::now());
+  profiler.enable(false);
+
+  const std::vector<llm::KernelStat> stats = profiler.stats();
+  double total_ms = 0.0;
+  for (const llm::KernelStat& s : stats) total_ms += s.ms;
+  const DevicePeaks peak = device_peaks();
+
+  std::printf("\nper-kernel breakdown of one profiled request (%.0f ms wall, %.0f ms on device)\n",
+              wall_ms, total_ms);
+  std::printf("device peaks: %.0f GB/s memory, %.0f GFLOP/s FP32 (no tensor cores)\n\n",
+              peak.bandwidth_gbps, peak.fp32_gflops);
+  std::printf("  %-14s %7s %9s %6s %9s %6s %9s %9s %6s %8s\n", "kernel", "calls", "ms", "%",
+              "GFLOP/s", "%peak", "req GB/s", "dram GB/s", "%peak", "re-read");
+  for (const llm::KernelStat& s : stats) {
+    const double seconds = s.ms / 1000.0;
+    const double gflops = seconds > 0.0 ? s.flops / seconds / 1e9 : 0.0;
+    const double gbps = seconds > 0.0 ? s.moved_bytes / seconds / 1e9 : 0.0;
+    const double dram_gbps = seconds > 0.0 ? s.dram_bytes / seconds / 1e9 : 0.0;
+    const double reread = s.ideal_bytes > 0.0 ? s.moved_bytes / s.ideal_bytes : 0.0;
+    std::printf("  %-14s %7llu %9.2f %6.1f %9.1f %6.1f %9.1f %9.1f %6.1f %8.1f\n", s.name.c_str(),
+                static_cast<unsigned long long>(s.calls), s.ms, 100.0 * s.ms / total_ms, gflops,
+                100.0 * gflops / peak.fp32_gflops, gbps, dram_gbps,
+                100.0 * dram_gbps / peak.bandwidth_gbps, reread);
+  }
+
+  // Everything the host spends outside kernel execution: launch overhead, the
+  // per-token device-to-host copy, and the synchronizes the event readback adds.
+  std::printf("\n  %-14s %9.2f ms (%.1f%% of wall) -- launches, token copies, profiling sync\n",
+              "host + gaps", wall_ms - total_ms, 100.0 * (wall_ms - total_ms) / wall_ms);
+  std::printf("  profiled TTFT %.2f ms, E2E %.2f ms (event timing adds a sync per region;\n"
+              "  compare against the unprofiled table above before trusting the wall number)\n",
+              profiled.ttft_ms, profiled.e2e_ms);
+  std::printf("\n  ms      device time summed over every launch in the region\n"
+              "  GFLOP/s useful floating-point work / device time\n"
+              "  req     traffic the kernel's blocking requests / device time\n"
+              "  dram    the part of it L2 cannot absorb / device time -- the roofline\n"
+              "          denominator, and the only bandwidth the bus really has to carry\n"
+              "  re-read requested traffic / compulsory traffic; 1.0 means every byte is\n"
+              "          read exactly once, higher means the tiling re-reads operands\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -132,6 +210,7 @@ int main(int argc, char** argv) {
   int tokens = 32;
   int runs = 20;
   int warmup = 2;
+  bool profile_kernels = false;
 
   for (int i = 1; i < argc; ++i) {
     const bool has_value = i + 1 < argc;
@@ -147,6 +226,8 @@ int main(int argc, char** argv) {
       runs = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--warmup") == 0 && has_value) {
       warmup = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--kernels") == 0) {
+      profile_kernels = true;
     } else {
       usage(argv[0]);
       return EXIT_FAILURE;
@@ -220,6 +301,8 @@ int main(int argc, char** argv) {
   print_row("E2E latency", "ms", e2e);
   print_row("TPS (decode)", "tok/s", tps_decode);
   print_row("TPS (e2e)", "tok/s", tps_e2e);
+
+  if (profile_kernels) print_kernel_report(model, prompt, tokens);
 
   if (runs < 100) {
     // Nearest-rank p99 of fewer than 100 samples is simply the maximum.

@@ -2,6 +2,7 @@ add_library(llm_engine
   src/device_info.cu
   src/loader.cpp
   src/model.cpp
+  src/profile.cpp
   kernels/vector_add.cu
   kernels/embedding_lookup.cu
   kernels/rmsnorm.cu
