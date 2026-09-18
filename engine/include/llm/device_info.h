@@ -6,8 +6,7 @@
 namespace llm {
 
 // Snapshot of the target device plus the empirically measured cost of simply
-// having a CUDA context alive. PLAN.md budgets 200-400MB for this; M0 exists to
-// replace that guess with a number from this machine.
+// having a CUDA context alive. 
 struct DeviceBaseline {
   int device = 0;
   std::string name;
@@ -47,7 +46,6 @@ struct DeviceBaseline {
 // cudaMemGetInfo calls. Exits the process on any CUDA error.
 DeviceBaseline query_device_baseline(int device = 0);
 
-// Human-readable multi-line report.
 std::string format_baseline(const DeviceBaseline& b);
 
 // Single machine-readable line: key=value pairs, for logging into docs/.
