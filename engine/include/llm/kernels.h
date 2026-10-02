@@ -59,6 +59,13 @@ void launch_gemv_fp16(const __half* weight, const float* x, float* y, int n_out,
 void launch_gemm_fp16(const __half* weight, const float* x, float* y, int m_rows, int n_out,
                       int k_in, void* stream = nullptr);
 
+// Appends `n_new` rows of freshly computed K and V into one layer's cache.
+// `new_k` and `new_v` are [n_new, kv_dim]; `k_cache` and `v_cache` are that
+// layer's [max_seq, kv_dim] slabs, and row i of the input lands at row
+// `start_pos + i`. The caller guarantees start_pos + n_new fits the slab.
+void launch_kv_cache_write(const float* new_k, const float* new_v, float* k_cache, float* v_cache,
+                           int n_new, int start_pos, int kv_dim, void* stream = nullptr);
+
 // scores[h, i, j] = dot(q[i, h, :], k[j, kv_head(h), :]) / sqrt(head_dim),
 // with -inf written wherever key j is in the future of query i. A query at row
 // i has absolute position `query_pos_offset + i`, so a full-sequence prefill

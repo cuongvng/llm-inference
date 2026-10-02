@@ -9,6 +9,7 @@ add_library(llm_engine
   kernels/rope.cu
   kernels/gemv_fp16.cu
   kernels/gemm_fp16.cu
+  kernels/kv_cache_write.cu
   kernels/attention_qk.cu
   kernels/softmax.cu
   kernels/attention_av.cu
@@ -38,6 +39,7 @@ add_library(llm::engine ALIAS llm_engine)
 set(LLM_TESTS
   test_vector_add
   test_device_baseline
+  test_kv_cache_write
 )
 
 foreach(test_name IN LISTS LLM_TESTS)
