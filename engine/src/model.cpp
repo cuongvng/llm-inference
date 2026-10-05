@@ -276,6 +276,7 @@ Model Model::load(const std::string& path, int max_tokens) {
          std::to_string(c.max_seq_len));
   }
   model.act_.allocate(c, max_tokens);
+  model.cache_.allocate(c, max_tokens);
 
   return model;
 }
