@@ -272,10 +272,10 @@ int main(int argc, char** argv) {
   std::printf("request    prompt %d tokens, generate %d tokens | %d warmup + %d measured runs\n",
               prompt_tokens, tokens, warmup, runs);
   std::printf("load       %.0f ms (disk read + VRAM upload, excluded below)\n", load_ms);
-  std::printf("vram       %.1f MiB measured by cudaMemGetInfo | %.1f weights + %.1f workspace "
-              "accounted\n\n",
+  std::printf("vram       %.1f MiB measured by cudaMemGetInfo | %.1f weights + %.1f workspace + "
+              "%.1f kv cache accounted\n\n",
               (free_before - free_after) / mib, model.weight_bytes() / mib,
-              model.workspace_bytes() / mib);
+              model.workspace_bytes() / mib, model.cache_bytes() / mib);
 
   for (int i = 0; i < warmup; ++i) run_request(model, prompt, tokens);
 
