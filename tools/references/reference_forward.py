@@ -1,25 +1,5 @@
 """Torch reference for the FP16 forward pass -- generates the fixtures ctest checks against.
 
-Dev-time only (tools/convert/requirements.txt); the C++ engine never runs this.
-It is invoked by CMake at build time so the fixtures can't drift from the
-reference math they encode.
-
-The reference is written directly in torch rather than pulled from
-`transformers` so this file, not a library version, is the definition of what
-the kernels must reproduce -- and so it stays runnable without a checkpoint or
-network access.
-
-Every fixture is itself a `.llmbin` file (docs/binary_format.md): the format
-already stores named, shaped, typed tensors, so the tests reuse the loader
-that milestone one proved instead of inventing a second container. Two
-conventions worth knowing:
-
-  * Integer payloads (token ids, positions, argmax results) are stored as FP32
-    and cast back on the C++ side -- the format's dtype tag has no int32.
-  * Weights are rounded to FP16 and the reference is then computed in FP32 from
-    those rounded values, so a comparison failure means the kernel is wrong,
-    not that the reference saw more precision than the GPU did.
-
 Usage:
     python reference_forward.py <out_dir>
 """
@@ -48,12 +28,12 @@ REF_CONFIG = binformat.ModelConfig(
     num_kv_heads=2,
     head_dim=8,
     intermediate_size=64,
-    max_seq_len=64,
+    max_seq_len=256,
     rope_theta=10000.0,
     rms_norm_eps=1e-5,
 )
 
-DECODE_STEPS = 8
+DECODE_STEPS = 200
 
 
 # --- fixture plumbing -------------------------------------------------------

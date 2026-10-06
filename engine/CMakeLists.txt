@@ -164,4 +164,13 @@ if(LLM_BUILD_REFERENCE_TESTS)
   add_test(NAME test_forward
            COMMAND test_forward ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin)
   set_tests_properties(test_forward PROPERTIES TIMEOUT 300)
+
+  # Needs no reference outputs -- it compares the engine against itself.
+  add_executable(test_kv_cache tests/test_kv_cache.cu)
+  target_link_libraries(test_kv_cache PRIVATE llm_engine)
+  target_include_directories(test_kv_cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  add_dependencies(test_kv_cache llm_reference_fixtures)
+  set_target_properties(test_kv_cache PROPERTIES CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
+  add_test(NAME test_kv_cache COMMAND test_kv_cache ${LLM_REF_DIR}/ref_model.llmbin)
+  set_tests_properties(test_kv_cache PROPERTIES TIMEOUT 300)
 endif()
