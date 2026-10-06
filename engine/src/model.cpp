@@ -11,9 +11,6 @@
 namespace llm {
 namespace {
 
-// Device allocations are 256-byte aligned by cudaMalloc; keeping every tensor
-// inside the shared weight buffer on the same boundary means a tensor's rows
-// start where the memory system expects them to, and costs a few KB total.
 constexpr std::size_t kWeightAlign = 256;
 
 std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
@@ -23,8 +20,6 @@ std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a;
   std::exit(EXIT_FAILURE);
 }
 
-// Every weight must be FP16 at this milestone; the quantized dtypes get their
-// own load path rather than being silently widened here.
 void check_tensor(const std::string& name, const TensorView& t, std::size_t expect_elems) {
   if (t.dtype != DType::kFP16) {
     fail("tensor '" + name + "' is not FP16 (quantized weights need the quantized load path)");
@@ -37,14 +32,6 @@ void check_tensor(const std::string& name, const TensorView& t, std::size_t expe
 }
 
 // Analytic cost models for the kernel profiler.
-//
-// `ideal` is the compulsory traffic: every distinct input read once, every
-// output written once -- what a perfect implementation of the operator would
-// move. `moved` is what this implementation's blocking actually asks the memory
-// system for. Where the two differ, the difference is re-read, and the ratio is
-// the first thing to look at when a kernel is slower than its bytes suggest.
-//
-// Activations are FP32 and weights FP16 throughout.
 constexpr double kF32 = 4.0;
 constexpr double kF16 = 2.0;
 
@@ -55,25 +42,18 @@ struct Cost {
   double dram = 0.0;
 };
 
-// An operand read `factor` times costs DRAM bandwidth only if it is too big for
-// L2 to hold between those reads. This is the one place a cache is modelled at
-// all, and it is what separates "the tiling asks for 110 GB/s" from "the memory
-// bus actually carries 35 GB/s".
 double dram_term(double bytes, double factor) {
   return bytes <= l2_cache_bytes() ? bytes : bytes * factor;
 }
 
 Cost embedding_cost(int tokens, int hidden) {
   const double n = static_cast<double>(tokens) * hidden;
-  // Distinct rows of a table far larger than L2: every gathered byte is a miss.
   return {0.0, n * (kF16 + kF32), n * (kF16 + kF32), n * (kF16 + kF32)};
 }
 
 Cost rmsnorm_cost(int rows, int hidden) {
   const double n = static_cast<double>(rows) * hidden;
   // Square-and-accumulate, then scale by the norm and by the weight.
-  // The second pass over the row is a re-read at request level even though a
-  // row this small is served from L1 in practice.
   const double ideal = 2.0 * n * kF32 + hidden * kF16;
   return {4.0 * n, ideal, 3.0 * n * kF32 + hidden * kF16, ideal};
 }
@@ -92,14 +72,7 @@ Cost gemm_cost(int m, int n, int k) {
   Cost c;
   c.flops = 2.0 * M * N * K;
   c.ideal = N * K * kF16 + M * K * kF32 + M * N * kF32;
-  // Every output tile stages its own 16 rows of x and 16 rows of the weight
-  // across the whole of k, so the weight matrix is re-read once per row-tile of
-  // m. That factor -- ceil(m / 16) -- is why a longer sequence costs more per
-  // token here than the FLOP count alone predicts.
   c.moved = tiles_m * tiles_n * kTile * K * (kF32 + kF16) + M * N * kF32;
-  // The weight matrix is megabytes and is re-read once per row-tile: all of
-  // that crosses the bus. The x tile is a few hundred KB at these sequence
-  // lengths, so its tiles_n re-reads are served by L2.
   c.dram = dram_term(N * K * kF16, tiles_m) + dram_term(M * K * kF32, tiles_n) + M * N * kF32;
   return c;
 }
@@ -121,19 +94,15 @@ Cost attention_qk_cost(int tokens, int heads, int kv_heads, int head_dim) {
 
 Cost softmax_cost(int rows, int row_len) {
   const double n = static_cast<double>(rows) * row_len;
-  // Three passes -- max, exp-sum, normalize -- so four row-sized accesses.
+  // 3 passes -- max, exp-sum, normalize -- so 4 row-sized accesses.
   return {4.0 * n, 2.0 * n * kF32, 4.0 * n * kF32, 2.0 * n * kF32};
 }
 
 Cost attention_av_cost(int tokens, int heads, int kv_heads, int head_dim) {
   const double h = heads, t = tokens, d = head_dim;
   Cost c;
-  // Masked keys carry probability 0 but are still multiplied through, so the
-  // full rectangle is executed.
   c.flops = 2.0 * h * t * t * d;
   c.ideal = h * t * t * kF32 + t * kv_heads * d * kF32 + t * h * d * kF32;
-  // The probability row broadcasts across the block; V is re-read in full by
-  // every (query, head) block.
   c.moved = h * t * t * kF32 + h * t * t * d * kF32 + t * h * d * kF32;
   c.dram = h * t * t * kF32 + dram_term(t * kv_heads * d * kF32, h * t) + t * h * d * kF32;
   return c;
@@ -176,9 +145,6 @@ void Activations::allocate(const ModelConfig& config, int tokens) {
   q.allocate(t * q_dim * sizeof(float));
   k.allocate(t * kv_dim * sizeof(float));
   v.allocate(t * kv_dim * sizeof(float));
-  // The score matrix is the one workspace buffer that grows quadratically with
-  // sequence length -- the term that decides how long a prompt fits in 4GB, and
-  // the first thing an online-softmax attention would delete.
   scores.allocate(static_cast<std::size_t>(config.num_heads) * t * t * sizeof(float));
   attn_out.allocate(t * q_dim * sizeof(float));
   proj.allocate(t * hidden * sizeof(float));
@@ -207,8 +173,6 @@ Model Model::load(const std::string& path, int max_tokens) {
   const std::size_t q_dim = static_cast<std::size_t>(c.num_heads) * c.head_dim;
   const std::size_t kv_dim = static_cast<std::size_t>(c.num_kv_heads) * c.head_dim;
 
-  // Name, expected element count. Order here is also the upload order, so
-  // tensors used together in a layer land next to each other in VRAM.
   std::vector<std::pair<std::string, std::size_t>> wanted = {
       {"tok_embeddings.weight", c.vocab_size * hidden},
       {"output_norm.weight", hidden},
@@ -227,9 +191,6 @@ Model Model::load(const std::string& path, int max_tokens) {
     wanted.push_back({p + "mlp.down_proj.weight", hidden * inter});
   }
 
-  // Size the whole thing first, then make exactly one cudaMalloc for it. This
-  // is the bump allocator's job in miniature: weights are loaded once and live
-  // for the process, so they need no free tracking and no per-tensor handle.
   std::size_t total = 0;
   std::vector<std::size_t> offsets;
   offsets.reserve(wanted.size());
@@ -288,11 +249,14 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
          std::to_string(act_.max_tokens));
   }
 
-  // Positions are 0..n_tokens-1 for a cacheless full-sequence pass. They are
-  // uploaded rather than assumed by the kernel because a cached decode step
-  // passes a single, much larger position.
+  const int cache_len = cache_.length();
+  if (cache_len + n_tokens > cache_.max_tokens()) {
+    fail("sequence of " + std::to_string(cache_len + n_tokens) + " tokens exceeds cache capacity " +
+         std::to_string(cache_.max_tokens()));
+  }
+
   std::vector<std::int32_t> positions(n_tokens);
-  for (int i = 0; i < n_tokens; ++i) positions[i] = i;
+  for (int i = 0; i < n_tokens; ++i) positions[i] = cache_len + i;
   act_.ids.upload(host_ids, static_cast<std::size_t>(n_tokens) * sizeof(std::int32_t));
   act_.positions.upload(positions.data(),
                         static_cast<std::size_t>(n_tokens) * sizeof(std::int32_t));
@@ -304,6 +268,7 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
   const int head_dim = static_cast<int>(config_.head_dim);
   const float eps = config_.rms_norm_eps;
   const std::size_t hidden_elems = static_cast<std::size_t>(n_tokens) * hidden;
+  const int n_keys = cache_len + n_tokens;
 
   const std::int32_t* d_ids = act_.ids.as<std::int32_t>();
   const std::int32_t* d_positions = act_.positions.as<std::int32_t>();
@@ -320,20 +285,15 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
   float* activated = act_.act.as<float>();
   float* logits = act_.logits.as<float>();
 
-  // The layer graph. Every step is a launch from llm/kernels.h -- no allocation,
-  // no host round trip, nothing between the launches.
-  //
-  // The profile_begin/profile_end pairs are inert unless the profiler is
-  // enabled. Each names a region of the graph rather than a single launch, so
-  // the q/k/v projections (identical shapes, launched back to back) report as
-  // one line.
   profile_begin_cost("embedding", embedding_cost(n_tokens, hidden));
   launch_embedding_lookup(tok_embeddings_, d_ids, x, n_tokens, hidden);
   profile_end();
 
-  for (const LayerWeights& layer : layers_) {
-    // Writes to a separate buffer, not back over x: the residual add below
-    // needs the un-normed stream.
+  for (std::size_t li = 0; li < layers_.size(); ++li) {
+    const LayerWeights& layer = layers_[li];
+    float* k_cache = cache_.layer_k(static_cast<int>(li));
+    float* v_cache = cache_.layer_v(static_cast<int>(li));
+
     profile_begin_cost("rmsnorm", rmsnorm_cost(n_tokens, hidden));
     launch_rmsnorm(x, layer.attn_norm, normed, n_tokens, hidden, eps);
     profile_end();
@@ -354,19 +314,20 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rope(q, k, d_positions, n_tokens, heads, kv_heads, head_dim, config_.rope_theta);
     profile_end();
 
+    launch_kv_cache_write(k, v, k_cache, v_cache, n_tokens, cache_len, kv_dim());
+
+    // Attention reads KV cache
     profile_begin_cost("attn.qk", attention_qk_cost(n_tokens, heads, kv_heads, head_dim));
-    launch_attention_qk(q, k, scores, n_tokens, n_tokens, heads, kv_heads, head_dim,
-                        /*query_pos_offset=*/0);
+    launch_attention_qk(q, k_cache, scores, n_tokens, n_keys, heads, kv_heads, head_dim,
+                        cache_len);
     profile_end();
 
-    // The score matrix is heads * n_tokens independent rows of length n_tokens;
-    // the causal mask is already baked into it as -inf.
-    profile_begin_cost("attn.softmax", softmax_cost(heads * n_tokens, n_tokens));
-    launch_softmax_rows(scores, heads * n_tokens, n_tokens);
+    profile_begin_cost("attn.softmax", softmax_cost(heads * n_tokens, n_keys));
+    launch_softmax_rows(scores, heads * n_tokens, n_keys);
     profile_end();
 
     profile_begin_cost("attn.av", attention_av_cost(n_tokens, heads, kv_heads, head_dim));
-    launch_attention_av(scores, v, attn_out, n_tokens, n_tokens, heads, kv_heads, head_dim);
+    launch_attention_av(scores, v_cache, attn_out, n_tokens, n_keys, heads, kv_heads, head_dim);
     profile_end();
 
     profile_begin_cost("gemm.wo", gemm_cost(n_tokens, hidden, q_dim()));
@@ -404,13 +365,12 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     profile_end();
   }
 
+  cache_.advance(n_tokens);
+
   profile_begin_cost("rmsnorm", rmsnorm_cost(n_tokens, hidden));
   launch_rmsnorm(x, output_norm_, normed, n_tokens, hidden, eps);
   profile_end();
 
-  // Logits for every position, not just the last: the reference checks all of
-  // them, which localizes a failure the token ids alone would report as one
-  // wrong number. With a KV cache only the final row needs computing.
   profile_begin_cost("gemm.lm_head",
                      gemm_cost(n_tokens, static_cast<int>(config_.vocab_size), hidden));
   launch_gemm_fp16(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size),
@@ -447,16 +407,20 @@ std::vector<std::int32_t> Model::generate(const std::vector<std::int32_t>& promp
   std::vector<std::int32_t> generated;
   generated.reserve(max_new_tokens);
 
+  reset_cache();
+  forward(prompt.data(), static_cast<int>(prompt.size()));
+  int last_forward_tokens = static_cast<int>(prompt.size());
+
   for (int step = 0; step < max_new_tokens; ++step) {
     if (static_cast<int>(sequence.size()) > act_.max_tokens) break;
-    // Recomputing the whole prefix every step is quadratic in the sequence
-    // length. That cost is the baseline the KV cache is measured against, so it
-    // stays exactly this naive here.
-    forward(sequence.data(), static_cast<int>(sequence.size()));
-    const std::int32_t next = argmax_last(static_cast<int>(sequence.size()));
+    const std::int32_t next = argmax_last(last_forward_tokens);
     generated.push_back(next);
     sequence.push_back(next);
     if (on_token) on_token(step, next);
+    if (step + 1 < max_new_tokens && static_cast<int>(sequence.size()) <= act_.max_tokens) {
+      forward(&next, 1);
+      last_forward_tokens = 1;
+    }
   }
   return generated;
 }

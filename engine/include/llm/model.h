@@ -62,6 +62,8 @@ class Model {
 
   void forward(const std::int32_t* host_ids, int n_tokens);
 
+  void reset_cache() { cache_.reset(); }
+
   // Copies the logits of the last forward pass back to the host.
   std::vector<float> logits_host(int n_tokens);
 
