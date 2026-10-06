@@ -8,9 +8,7 @@
 namespace llm {
 namespace {
 
-// Little-endian fixed-width reads from a byte cursor. This project targets
-// x86-64 hosts only (docs/binary_format.md), so a plain memcpy is the whole
-// implementation -- no byte-swapping path exists.
+// Little-endian fixed-width reads from a byte cursor. 
 class Cursor {
  public:
   Cursor(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}

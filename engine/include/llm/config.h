@@ -4,8 +4,6 @@
 
 namespace llm {
 
-// Mirrors the dtype tag in docs/binary_format.md / tools/convert/binformat.py.
-// Keep the numeric values in sync by hand -- there is no shared schema.
 enum class DType : std::uint32_t {
   kFP32 = 0,
   kFP16 = 1,
@@ -23,8 +21,6 @@ inline std::size_t dtype_size_bytes(DType dtype) {
   return 0;
 }
 
-// Mirrors the fixed-field header in docs/binary_format.md. Field order matches
-// the byte layout exactly -- do not reorder without bumping the format version.
 struct ModelConfig {
   std::uint32_t vocab_size = 0;
   std::uint32_t hidden_size = 0;
