@@ -77,18 +77,24 @@ Cost gemm_cost(int m, int n, int k) {
   return c;
 }
 
-Cost attention_qk_cost(int tokens, int heads, int kv_heads, int head_dim) {
-  const double h = heads, t = tokens, d = head_dim;
-  // Causal masking leaves half the score matrix live; the masked half costs a
-  // store and no arithmetic.
-  const double live = h * t * (t + 1.0) / 2.0;
+// Query i sits at absolute position n_keys - n_query + i, so it may see that
+// many keys plus itself; summing over the queries gives the live score count.
+double live_scores(double n_query, double n_keys) {
+  return n_query * n_keys - n_query * (n_query - 1.0) / 2.0;
+}
+
+Cost attention_qk_cost(int n_query, int n_keys, int heads, int kv_heads, int head_dim) {
+  const double h = heads, nq = n_query, nk = n_keys, d = head_dim;
+  // Causal masking leaves only part of the score matrix live; the masked
+  // entries cost a store and no arithmetic.
+  const double live = h * live_scores(nq, nk);
   Cost c;
   c.flops = 2.0 * d * live;
-  c.ideal = t * h * d * kF32 + t * kv_heads * d * kF32 + h * t * t * kF32;
+  c.ideal = nq * h * d * kF32 + nk * kv_heads * d * kF32 + h * nq * nk * kF32;
   // One block per (query, head) stages its query once and streams the keys it
   // is allowed to see, so K is re-read once per query row.
-  c.moved = h * t * d * kF32 + live * d * kF32 + h * t * t * kF32;
-  c.dram = h * t * d * kF32 + dram_term(t * kv_heads * d * kF32, live / t) + h * t * t * kF32;
+  c.moved = h * nq * d * kF32 + live * d * kF32 + h * nq * nk * kF32;
+  c.dram = h * nq * d * kF32 + dram_term(nk * kv_heads * d * kF32, live / nq) + h * nq * nk * kF32;
   return c;
 }
 
@@ -98,14 +104,22 @@ Cost softmax_cost(int rows, int row_len) {
   return {4.0 * n, 2.0 * n * kF32, 4.0 * n * kF32, 2.0 * n * kF32};
 }
 
-Cost attention_av_cost(int tokens, int heads, int kv_heads, int head_dim) {
-  const double h = heads, t = tokens, d = head_dim;
+// Unlike qk this reads the masked entries too -- they are zeros after softmax,
+// so the full n_query * n_keys matrix is touched.
+Cost attention_av_cost(int n_query, int n_keys, int heads, int kv_heads, int head_dim) {
+  const double h = heads, nq = n_query, nk = n_keys, d = head_dim;
   Cost c;
-  c.flops = 2.0 * h * t * t * d;
-  c.ideal = h * t * t * kF32 + t * kv_heads * d * kF32 + t * h * d * kF32;
-  c.moved = h * t * t * kF32 + h * t * t * d * kF32 + t * h * d * kF32;
-  c.dram = h * t * t * kF32 + dram_term(t * kv_heads * d * kF32, h * t) + t * h * d * kF32;
+  c.flops = 2.0 * h * nq * nk * d;
+  c.ideal = h * nq * nk * kF32 + nk * kv_heads * d * kF32 + nq * h * d * kF32;
+  c.moved = h * nq * nk * kF32 + h * nq * nk * d * kF32 + nq * h * d * kF32;
+  c.dram = h * nq * nk * kF32 + dram_term(nk * kv_heads * d * kF32, h * nq) + nq * h * d * kF32;
   return c;
+}
+
+// A straight copy of K and V into the cache: each is read once and written once.
+Cost kv_write_cost(int n_new, int kv_dim) {
+  const double b = 4.0 * static_cast<double>(n_new) * kv_dim * kF32;
+  return {0.0, b, b, b};
 }
 
 Cost swiglu_cost(std::size_t n) {
@@ -314,10 +328,12 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rope(q, k, d_positions, n_tokens, heads, kv_heads, head_dim, config_.rope_theta);
     profile_end();
 
+    profile_begin_cost("kv_write", kv_write_cost(n_tokens, kv_dim()));
     launch_kv_cache_write(k, v, k_cache, v_cache, n_tokens, cache_len, kv_dim());
+    profile_end();
 
     // Attention reads KV cache
-    profile_begin_cost("attn.qk", attention_qk_cost(n_tokens, heads, kv_heads, head_dim));
+    profile_begin_cost("attn.qk", attention_qk_cost(n_tokens, n_keys, heads, kv_heads, head_dim));
     launch_attention_qk(q, k_cache, scores, n_tokens, n_keys, heads, kv_heads, head_dim,
                         cache_len);
     profile_end();
@@ -326,7 +342,7 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_softmax_rows(scores, heads * n_tokens, n_keys);
     profile_end();
 
-    profile_begin_cost("attn.av", attention_av_cost(n_tokens, heads, kv_heads, head_dim));
+    profile_begin_cost("attn.av", attention_av_cost(n_tokens, n_keys, heads, kv_heads, head_dim));
     launch_attention_av(scores, v_cache, attn_out, n_tokens, n_keys, heads, kv_heads, head_dim);
     profile_end();
 
