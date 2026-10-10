@@ -77,6 +77,28 @@ Cost gemm_cost(int m, int n, int k) {
   return c;
 }
 
+// One warp per output row: every weight byte is read once, x is re-read by every row from cache.
+Cost gemv_cost(int n, int k) {
+  const double N = n, K = k;
+  Cost c;
+  c.flops = 2.0 * N * K;
+  c.ideal = N * K * kF16 + K * kF32 + N * kF32;
+  c.moved = N * K * (kF16 + kF32) + N * kF32;
+  c.dram = N * K * kF16 + dram_term(K * kF32, N) + N * kF32;
+  return c;
+}
+
+Cost matmul_cost(int m, int n, int k) { return m == 1 ? gemv_cost(n, k) : gemm_cost(m, n, k); }
+
+// Decode (one token) is weight-bandwidth bound and goes to the GEMV; prefill reuses weights via the GEMM.
+void matmul(const __half* weight, const float* x, float* y, int m, int n, int k) {
+  if (m == 1) {
+    launch_gemv_fp16(weight, x, y, n, k);
+  } else {
+    launch_gemm_fp16(weight, x, y, m, n, k);
+  }
+}
+
 // Query i sits at absolute position n_keys - n_query + i, so it may see that
 // many keys plus itself; summing over the queries gives the live score count.
 double live_scores(double n_query, double n_keys) {
@@ -312,16 +334,16 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rmsnorm(x, layer.attn_norm, normed, n_tokens, hidden, eps);
     profile_end();
 
-    Cost qkv = gemm_cost(n_tokens, q_dim(), hidden);
-    const Cost kv_one = gemm_cost(n_tokens, kv_dim(), hidden);
+    Cost qkv = matmul_cost(n_tokens, q_dim(), hidden);
+    const Cost kv_one = matmul_cost(n_tokens, kv_dim(), hidden);
     qkv.flops += 2.0 * kv_one.flops;
     qkv.ideal += 2.0 * kv_one.ideal;
     qkv.moved += 2.0 * kv_one.moved;
     qkv.dram += 2.0 * kv_one.dram;
     profile_begin_cost("gemm.qkv", qkv);
-    launch_gemm_fp16(layer.wq, normed, q, n_tokens, q_dim(), hidden);
-    launch_gemm_fp16(layer.wk, normed, k, n_tokens, kv_dim(), hidden);
-    launch_gemm_fp16(layer.wv, normed, v, n_tokens, kv_dim(), hidden);
+    matmul(layer.wq, normed, q, n_tokens, q_dim(), hidden);
+    matmul(layer.wk, normed, k, n_tokens, kv_dim(), hidden);
+    matmul(layer.wv, normed, v, n_tokens, kv_dim(), hidden);
     profile_end();
 
     profile_begin_cost("rope", rope_cost(n_tokens, q_dim(), kv_dim()));
@@ -346,8 +368,8 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_attention_av(scores, v_cache, attn_out, n_tokens, n_keys, heads, kv_heads, head_dim);
     profile_end();
 
-    profile_begin_cost("gemm.wo", gemm_cost(n_tokens, hidden, q_dim()));
-    launch_gemm_fp16(layer.wo, attn_out, proj, n_tokens, hidden, q_dim());
+    profile_begin_cost("gemm.wo", matmul_cost(n_tokens, hidden, q_dim()));
+    matmul(layer.wo, attn_out, proj, n_tokens, hidden, q_dim());
     profile_end();
 
     profile_begin_cost("residual", residual_cost(hidden_elems));
@@ -358,22 +380,22 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rmsnorm(x, layer.ffn_norm, normed, n_tokens, hidden, eps);
     profile_end();
 
-    Cost gate_up = gemm_cost(n_tokens, inter, hidden);
+    Cost gate_up = matmul_cost(n_tokens, inter, hidden);
     gate_up.flops *= 2.0;
     gate_up.ideal *= 2.0;
     gate_up.moved *= 2.0;
     gate_up.dram *= 2.0;
     profile_begin_cost("gemm.gate_up", gate_up);
-    launch_gemm_fp16(layer.gate_proj, normed, gate, n_tokens, inter, hidden);
-    launch_gemm_fp16(layer.up_proj, normed, up, n_tokens, inter, hidden);
+    matmul(layer.gate_proj, normed, gate, n_tokens, inter, hidden);
+    matmul(layer.up_proj, normed, up, n_tokens, inter, hidden);
     profile_end();
 
     profile_begin_cost("swiglu", swiglu_cost(static_cast<std::size_t>(n_tokens) * inter));
     launch_swiglu(gate, up, activated, static_cast<std::size_t>(n_tokens) * inter);
     profile_end();
 
-    profile_begin_cost("gemm.down", gemm_cost(n_tokens, hidden, inter));
-    launch_gemm_fp16(layer.down_proj, activated, proj, n_tokens, hidden, inter);
+    profile_begin_cost("gemm.down", matmul_cost(n_tokens, hidden, inter));
+    matmul(layer.down_proj, activated, proj, n_tokens, hidden, inter);
     profile_end();
 
     profile_begin_cost("residual", residual_cost(hidden_elems));
@@ -388,8 +410,8 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
   profile_end();
 
   profile_begin_cost("gemm.lm_head",
-                     gemm_cost(n_tokens, static_cast<int>(config_.vocab_size), hidden));
-  launch_gemm_fp16(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size),
+                     matmul_cost(n_tokens, static_cast<int>(config_.vocab_size), hidden));
+  matmul(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size),
                    hidden);
   profile_end();
 }
