@@ -1,22 +1,23 @@
-"""HuggingFace checkpoint -> .llmbin (docs/binary_format.md), FP16, unquantized.
+"""HuggingFace checkpoint -> .llmbin (docs/binary_format.md).
 
 Dev-time only -- needs torch/transformers/safetensors (tools/convert/requirements.txt),
-none of which are runtime dependencies of the C++ engine (DESIGN_QA.md). Quantization
-(INT8/INT4, group-wise) is layered on top of this in quantize.py at M4; this script
-always emits FP16 so its output can serve as the M2/M3 torch-reference baseline too.
+none of which are runtime dependencies of the C++ engine. With --quant int8/int4 the matmul weights (7 per layer + lm_head) are quantized group-wise
+by quantize.py; embeddings and norms always stay FP16.
 
 Targets Llama-architecture checkpoints (TinyLlama-1.1B and compatible): RoPE,
 RMSNorm, GQA, SwiGLU. Tensor names in the output file match what
 engine/src/model.cpp expects to find via ModelFile::find().
 
 Usage:
-    python convert_weights.py --model <hf-repo-or-local-dir> --out model.llmbin
+    python convert_weights.py --model <hf-repo-or-local-dir> --out model.llmbin \\
+        [--quant fp16|int8|int4] [--group 128]
 """
 
 import argparse
 import sys
 
 import binformat
+import quantize
 
 
 def _load_hf_model(model_path: str):
@@ -33,7 +34,7 @@ def _fp16_bytes(tensor) -> bytes:
     return tensor.detach().to("cpu", dtype=__import__("torch").float16).contiguous().numpy().tobytes()
 
 
-def convert(model_path: str, out_path: str) -> None:
+def convert(model_path: str, out_path: str, quant: str = "fp16", group: int = 128) -> None:
     hf_config, model = _load_hf_model(model_path)
     sd = model.state_dict()
 
@@ -56,25 +57,41 @@ def convert(model_path: str, out_path: str) -> None:
         t = sd[hf_key]
         writer.add_tensor(name, binformat.DTYPE_FP16, tuple(t.shape), _fp16_bytes(t))
 
+    def add_linear(name: str, hf_key: str):
+        if quant == "fp16":
+            return add(name, hf_key)
+        w = sd[hf_key].detach().to("cpu", dtype=__import__("torch").float16).float().numpy()
+        base = name.removesuffix(".weight")
+        if quant == "int8":
+            q, scales = quantize.quantize_int8(w, group)
+            writer.add_tensor(name, binformat.DTYPE_INT8, w.shape, q.tobytes())
+        else:
+            q, scales, mins = quantize.quantize_int4(w, group)
+            writer.add_tensor(name, binformat.DTYPE_INT4, w.shape, q.tobytes())
+            writer.add_tensor(base + ".mins", binformat.DTYPE_FP16, mins.shape, mins.tobytes())
+        writer.add_tensor(base + ".scales", binformat.DTYPE_FP16, scales.shape, scales.tobytes())
+
     add("tok_embeddings.weight", "model.embed_tokens.weight")
     add("output_norm.weight", "model.norm.weight")
-    add("lm_head.weight", "lm_head.weight")
+    add_linear("lm_head.weight", "lm_head.weight")
 
     for layer in range(config.num_layers):
         p = f"model.layers.{layer}."
         o = f"layers.{layer}."
         add(o + "attn_norm.weight", p + "input_layernorm.weight")
-        add(o + "attn.wq.weight", p + "self_attn.q_proj.weight")
-        add(o + "attn.wk.weight", p + "self_attn.k_proj.weight")
-        add(o + "attn.wv.weight", p + "self_attn.v_proj.weight")
-        add(o + "attn.wo.weight", p + "self_attn.o_proj.weight")
+        add_linear(o + "attn.wq.weight", p + "self_attn.q_proj.weight")
+        add_linear(o + "attn.wk.weight", p + "self_attn.k_proj.weight")
+        add_linear(o + "attn.wv.weight", p + "self_attn.v_proj.weight")
+        add_linear(o + "attn.wo.weight", p + "self_attn.o_proj.weight")
         add(o + "ffn_norm.weight", p + "post_attention_layernorm.weight")
-        add(o + "mlp.gate_proj.weight", p + "mlp.gate_proj.weight")
-        add(o + "mlp.up_proj.weight", p + "mlp.up_proj.weight")
-        add(o + "mlp.down_proj.weight", p + "mlp.down_proj.weight")
+        add_linear(o + "mlp.gate_proj.weight", p + "mlp.gate_proj.weight")
+        add_linear(o + "mlp.up_proj.weight", p + "mlp.up_proj.weight")
+        add_linear(o + "mlp.down_proj.weight", p + "mlp.down_proj.weight")
 
     writer.write(out_path)
-    print(f"wrote {out_path}: {len(writer.tensors)} tensors, vocab={config.vocab_size}, "
+    total = sum(len(t.data) for t in writer.tensors)
+    print(f"wrote {out_path} ({quant}{'' if quant == 'fp16' else f', group {group}'}): "
+          f"{len(writer.tensors)} tensors, {total / 2**20:.1f} MiB, vocab={config.vocab_size}, "
           f"layers={config.num_layers}, hidden={config.hidden_size}")
 
 
@@ -82,8 +99,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF repo id or local checkpoint dir")
     ap.add_argument("--out", required=True, help="output .llmbin path")
+    ap.add_argument("--quant", choices=["fp16", "int8", "int4"], default="fp16",
+                    help="format of the matmul weights (default fp16)")
+    ap.add_argument("--group", type=int, default=128, help="values per scale along K (default 128)")
     args = ap.parse_args()
-    convert(args.model, args.out)
+    convert(args.model, args.out, args.quant, args.group)
 
 
 if __name__ == "__main__":
