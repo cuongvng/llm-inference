@@ -22,13 +22,54 @@ std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a;
 
 void check_tensor(const std::string& name, const TensorView& t, std::size_t expect_elems) {
   if (t.dtype != DType::kFP16) {
-    fail("tensor '" + name + "' is not FP16 (quantized weights need the quantized load path)");
+    fail("tensor '" + name + "' is not FP16");
   }
   const std::size_t elems = t.nbytes / dtype_size_bytes(DType::kFP16);
   if (elems != expect_elems) {
     fail("tensor '" + name + "' has " + std::to_string(elems) + " elements, expected " +
          std::to_string(expect_elems));
   }
+}
+
+struct LinearTensors {
+  const TensorView* weight = nullptr;
+  const TensorView* scales = nullptr;
+  const TensorView* mins = nullptr;
+  int group_size = 0;
+};
+
+// Validates a matmul weight [n, k] in any supported format, plus its per-group scales/mins if quantized.
+LinearTensors check_linear(const ModelFile& file, const std::string& name, std::size_t n, std::size_t k) {
+  LinearTensors l;
+  l.weight = &file.require(name);
+  const DType dtype = l.weight->dtype;
+  if (dtype == DType::kFP16) {
+    check_tensor(name, *l.weight, n * k);
+    return l;
+  }
+  if (dtype != DType::kINT8 && dtype != DType::kINT4) {
+    fail("tensor '" + name + "' has unsupported dtype " + std::to_string(static_cast<unsigned>(dtype)));
+  }
+  const std::size_t expect_bytes = dtype == DType::kINT8 ? n * k : n * k / 2;
+  if (l.weight->nbytes != expect_bytes) {
+    fail("tensor '" + name + "' has " + std::to_string(l.weight->nbytes) + " bytes, expected " +
+         std::to_string(expect_bytes));
+  }
+
+  const std::string base = name.substr(0, name.size() - std::string(".weight").size());
+  l.scales = &file.require(base + ".scales");
+  const std::size_t groups = l.scales->ndim == 2 && l.scales->dim(0) == n ? l.scales->dim(1) : 0;
+  if (groups == 0 || k % groups != 0 || (k / groups) % 32 != 0) {
+    fail("tensor '" + base + ".scales' must be [" + std::to_string(n) + ", K/G] with G dividing " +
+         std::to_string(k) + " and a multiple of 32");
+  }
+  l.group_size = static_cast<int>(k / groups);
+  check_tensor(base + ".scales", *l.scales, n * groups);
+  if (dtype == DType::kINT4) {
+    l.mins = &file.require(base + ".mins");
+    check_tensor(base + ".mins", *l.mins, n * groups);
+  }
+  return l;
 }
 
 // Analytic cost models for the kernel profiler.
@@ -64,38 +105,52 @@ Cost rope_cost(int tokens, int q_dim, int kv_dim) {
   return {3.0 * n, 2.0 * n * kF32, 2.0 * n * kF32, 2.0 * n * kF32};
 }
 
-Cost gemm_cost(int m, int n, int k) {
+// Bytes read per weight element, including its share of the group's scale (and min).
+double weight_bytes(const QuantWeight& w) {
+  switch (w.dtype) {
+    case DType::kINT8: return 1.0 + kF16 / w.group_size;
+    case DType::kINT4: return 0.5 + 2.0 * kF16 / w.group_size;
+    default: return kF16;
+  }
+}
+
+Cost gemm_cost(int m, int n, int k, double wb) {
   constexpr double kTile = 16.0;
   const double M = m, N = n, K = k;
   const double tiles_m = std::ceil(M / kTile);
   const double tiles_n = std::ceil(N / kTile);
   Cost c;
   c.flops = 2.0 * M * N * K;
-  c.ideal = N * K * kF16 + M * K * kF32 + M * N * kF32;
-  c.moved = tiles_m * tiles_n * kTile * K * (kF32 + kF16) + M * N * kF32;
-  c.dram = dram_term(N * K * kF16, tiles_m) + dram_term(M * K * kF32, tiles_n) + M * N * kF32;
+  c.ideal = N * K * wb + M * K * kF32 + M * N * kF32;
+  c.moved = tiles_m * tiles_n * kTile * K * (kF32 + wb) + M * N * kF32;
+  c.dram = dram_term(N * K * wb, tiles_m) + dram_term(M * K * kF32, tiles_n) + M * N * kF32;
   return c;
 }
 
 // One warp per output row: every weight byte is read once, x is re-read by every row from cache.
-Cost gemv_cost(int n, int k) {
+Cost gemv_cost(int n, int k, double wb) {
   const double N = n, K = k;
   Cost c;
   c.flops = 2.0 * N * K;
-  c.ideal = N * K * kF16 + K * kF32 + N * kF32;
-  c.moved = N * K * (kF16 + kF32) + N * kF32;
-  c.dram = N * K * kF16 + dram_term(K * kF32, N) + N * kF32;
+  c.ideal = N * K * wb + K * kF32 + N * kF32;
+  c.moved = N * K * (wb + kF32) + N * kF32;
+  c.dram = N * K * wb + dram_term(K * kF32, N) + N * kF32;
   return c;
 }
 
-Cost matmul_cost(int m, int n, int k) { return m == 1 ? gemv_cost(n, k) : gemm_cost(m, n, k); }
+Cost matmul_cost(const QuantWeight& w, int m, int n, int k) {
+  return m == 1 ? gemv_cost(n, k, weight_bytes(w)) : gemm_cost(m, n, k, weight_bytes(w));
+}
 
 // Decode (one token) is weight-bandwidth bound and goes to the GEMV; prefill reuses weights via the GEMM.
-void matmul(const __half* weight, const float* x, float* y, int m, int n, int k) {
+void matmul(const QuantWeight& w, const float* x, float* y, int m, int n, int k) {
+  if (w.dtype != DType::kFP16) {
+    fail(std::string("no matmul kernel for ") + (w.dtype == DType::kINT8 ? "INT8" : "INT4") + " weights yet");
+  }
   if (m == 1) {
-    launch_gemv_fp16(weight, x, y, n, k);
+    launch_gemv_fp16(w.fp16(), x, y, n, k);
   } else {
-    launch_gemm_fp16(weight, x, y, m, n, k);
+    launch_gemm_fp16(w.fp16(), x, y, m, n, k);
   }
 }
 
@@ -209,62 +264,107 @@ Model Model::load(const std::string& path, int max_tokens) {
   const std::size_t q_dim = static_cast<std::size_t>(c.num_heads) * c.head_dim;
   const std::size_t kv_dim = static_cast<std::size_t>(c.num_kv_heads) * c.head_dim;
 
-  std::vector<std::pair<std::string, std::size_t>> wanted = {
-      {"tok_embeddings.weight", c.vocab_size * hidden},
-      {"output_norm.weight", hidden},
-      {"lm_head.weight", c.vocab_size * hidden},
+  // Every tensor goes into one device allocation; slots index `uploads` until the pointers exist.
+  std::vector<const TensorView*> uploads;
+  constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
+  auto add_fp16 = [&](const std::string& name, std::size_t expect) {
+    const TensorView& t = file.require(name);
+    check_tensor(name, t, expect);
+    uploads.push_back(&t);
+    return uploads.size() - 1;
   };
+
+  struct LinearSlots {
+    DType dtype = DType::kFP16;
+    int group_size = 0;
+    std::size_t data = kNoSlot, scales = kNoSlot, mins = kNoSlot;
+  };
+  auto add_linear = [&](const std::string& name, std::size_t n, std::size_t k) {
+    const LinearTensors l = check_linear(file, name, n, k);
+    LinearSlots slots;
+    slots.dtype = l.weight->dtype;
+    slots.group_size = l.group_size;
+    uploads.push_back(l.weight);
+    slots.data = uploads.size() - 1;
+    if (l.scales) {
+      uploads.push_back(l.scales);
+      slots.scales = uploads.size() - 1;
+    }
+    if (l.mins) {
+      uploads.push_back(l.mins);
+      slots.mins = uploads.size() - 1;
+    }
+    return slots;
+  };
+
+  struct LayerSlots {
+    std::size_t attn_norm, ffn_norm;
+    LinearSlots wq, wk, wv, wo, gate_proj, up_proj, down_proj;
+  };
+
+  const std::size_t tok_embeddings = add_fp16("tok_embeddings.weight", c.vocab_size * hidden);
+  const std::size_t output_norm = add_fp16("output_norm.weight", hidden);
+  const LinearSlots lm_head = add_linear("lm_head.weight", c.vocab_size, hidden);
+  std::vector<LayerSlots> layer_slots(c.num_layers);
   for (std::uint32_t i = 0; i < c.num_layers; ++i) {
     const std::string p = "layers." + std::to_string(i) + ".";
-    wanted.push_back({p + "attn_norm.weight", hidden});
-    wanted.push_back({p + "attn.wq.weight", q_dim * hidden});
-    wanted.push_back({p + "attn.wk.weight", kv_dim * hidden});
-    wanted.push_back({p + "attn.wv.weight", kv_dim * hidden});
-    wanted.push_back({p + "attn.wo.weight", hidden * q_dim});
-    wanted.push_back({p + "ffn_norm.weight", hidden});
-    wanted.push_back({p + "mlp.gate_proj.weight", inter * hidden});
-    wanted.push_back({p + "mlp.up_proj.weight", inter * hidden});
-    wanted.push_back({p + "mlp.down_proj.weight", hidden * inter});
+    LayerSlots& l = layer_slots[i];
+    l.attn_norm = add_fp16(p + "attn_norm.weight", hidden);
+    l.wq = add_linear(p + "attn.wq.weight", q_dim, hidden);
+    l.wk = add_linear(p + "attn.wk.weight", kv_dim, hidden);
+    l.wv = add_linear(p + "attn.wv.weight", kv_dim, hidden);
+    l.wo = add_linear(p + "attn.wo.weight", hidden, q_dim);
+    l.ffn_norm = add_fp16(p + "ffn_norm.weight", hidden);
+    l.gate_proj = add_linear(p + "mlp.gate_proj.weight", inter, hidden);
+    l.up_proj = add_linear(p + "mlp.up_proj.weight", inter, hidden);
+    l.down_proj = add_linear(p + "mlp.down_proj.weight", hidden, inter);
   }
 
   std::size_t total = 0;
   std::vector<std::size_t> offsets;
-  offsets.reserve(wanted.size());
-  for (const auto& [name, expect] : wanted) {
-    const TensorView& t = file.require(name);
-    check_tensor(name, t, expect);
+  offsets.reserve(uploads.size());
+  for (const TensorView* t : uploads) {
     offsets.push_back(total);
-    total = align_up(total + t.nbytes, kWeightAlign);
+    total = align_up(total + t->nbytes, kWeightAlign);
   }
   model.weights_.allocate(total);
 
-  std::vector<const __half*> device_ptrs;
-  device_ptrs.reserve(wanted.size());
   auto* base = model.weights_.as<std::uint8_t>();
-  for (std::size_t i = 0; i < wanted.size(); ++i) {
-    const TensorView& t = file.require(wanted[i].first);
+  for (std::size_t i = 0; i < uploads.size(); ++i) {
     LLM_CUDA_CHECK(
-        cudaMemcpy(base + offsets[i], t.data, t.nbytes, cudaMemcpyHostToDevice));
-    device_ptrs.push_back(reinterpret_cast<const __half*>(base + offsets[i]));
+        cudaMemcpy(base + offsets[i], uploads[i]->data, uploads[i]->nbytes, cudaMemcpyHostToDevice));
   }
 
-  model.tok_embeddings_ = device_ptrs[0];
-  model.output_norm_ = device_ptrs[1];
-  model.lm_head_ = device_ptrs[2];
+  auto half_at = [&](std::size_t slot) {
+    return slot == kNoSlot ? nullptr : reinterpret_cast<const __half*>(base + offsets[slot]);
+  };
+  auto resolve = [&](const LinearSlots& slots) {
+    QuantWeight w;
+    w.dtype = slots.dtype;
+    w.data = base + offsets[slots.data];
+    w.scales = half_at(slots.scales);
+    w.mins = half_at(slots.mins);
+    w.group_size = slots.group_size;
+    return w;
+  };
+
+  model.tok_embeddings_ = half_at(tok_embeddings);
+  model.output_norm_ = half_at(output_norm);
+  model.lm_head_ = resolve(lm_head);
 
   model.layers_.resize(c.num_layers);
   for (std::uint32_t i = 0; i < c.num_layers; ++i) {
-    const std::size_t b = 3 + static_cast<std::size_t>(i) * 9;
+    const LayerSlots& s = layer_slots[i];
     LayerWeights& l = model.layers_[i];
-    l.attn_norm = device_ptrs[b + 0];
-    l.wq = device_ptrs[b + 1];
-    l.wk = device_ptrs[b + 2];
-    l.wv = device_ptrs[b + 3];
-    l.wo = device_ptrs[b + 4];
-    l.ffn_norm = device_ptrs[b + 5];
-    l.gate_proj = device_ptrs[b + 6];
-    l.up_proj = device_ptrs[b + 7];
-    l.down_proj = device_ptrs[b + 8];
+    l.attn_norm = half_at(s.attn_norm);
+    l.wq = resolve(s.wq);
+    l.wk = resolve(s.wk);
+    l.wv = resolve(s.wv);
+    l.wo = resolve(s.wo);
+    l.ffn_norm = half_at(s.ffn_norm);
+    l.gate_proj = resolve(s.gate_proj);
+    l.up_proj = resolve(s.up_proj);
+    l.down_proj = resolve(s.down_proj);
   }
 
   if (max_tokens <= 0) fail("max_tokens must be positive");
@@ -334,8 +434,8 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rmsnorm(x, layer.attn_norm, normed, n_tokens, hidden, eps);
     profile_end();
 
-    Cost qkv = matmul_cost(n_tokens, q_dim(), hidden);
-    const Cost kv_one = matmul_cost(n_tokens, kv_dim(), hidden);
+    Cost qkv = matmul_cost(layer.wq, n_tokens, q_dim(), hidden);
+    const Cost kv_one = matmul_cost(layer.wk, n_tokens, kv_dim(), hidden);
     qkv.flops += 2.0 * kv_one.flops;
     qkv.ideal += 2.0 * kv_one.ideal;
     qkv.moved += 2.0 * kv_one.moved;
@@ -368,7 +468,7 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_attention_av(scores, v_cache, attn_out, n_tokens, n_keys, heads, kv_heads, head_dim);
     profile_end();
 
-    profile_begin_cost("gemm.wo", matmul_cost(n_tokens, hidden, q_dim()));
+    profile_begin_cost("gemm.wo", matmul_cost(layer.wo, n_tokens, hidden, q_dim()));
     matmul(layer.wo, attn_out, proj, n_tokens, hidden, q_dim());
     profile_end();
 
@@ -380,7 +480,7 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_rmsnorm(x, layer.ffn_norm, normed, n_tokens, hidden, eps);
     profile_end();
 
-    Cost gate_up = matmul_cost(n_tokens, inter, hidden);
+    Cost gate_up = matmul_cost(layer.gate_proj, n_tokens, inter, hidden);
     gate_up.flops *= 2.0;
     gate_up.ideal *= 2.0;
     gate_up.moved *= 2.0;
@@ -394,7 +494,7 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
     launch_swiglu(gate, up, activated, static_cast<std::size_t>(n_tokens) * inter);
     profile_end();
 
-    profile_begin_cost("gemm.down", matmul_cost(n_tokens, hidden, inter));
+    profile_begin_cost("gemm.down", matmul_cost(layer.down_proj, n_tokens, hidden, inter));
     matmul(layer.down_proj, activated, proj, n_tokens, hidden, inter);
     profile_end();
 
@@ -410,9 +510,8 @@ void Model::forward(const std::int32_t* host_ids, int n_tokens) {
   profile_end();
 
   profile_begin_cost("gemm.lm_head",
-                     matmul_cost(n_tokens, static_cast<int>(config_.vocab_size), hidden));
-  matmul(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size),
-                   hidden);
+                     matmul_cost(lm_head_, n_tokens, static_cast<int>(config_.vocab_size), hidden));
+  matmul(lm_head_, normed, logits, n_tokens, static_cast<int>(config_.vocab_size), hidden);
   profile_end();
 }
 

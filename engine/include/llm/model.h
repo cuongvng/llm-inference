@@ -14,16 +14,27 @@
 
 namespace llm {
 
+// A matmul weight [N, K] in any stored format; scales/mins are [N, K / group_size]
+struct QuantWeight {
+  DType dtype = DType::kFP16;
+  const void* data = nullptr;
+  const __half* scales = nullptr;  // INT8 / INT4 only
+  const __half* mins = nullptr;    // INT4 only
+  int group_size = 0;              // 0 for FP16
+
+  const __half* fp16() const { return static_cast<const __half*>(data); }
+};
+
 struct LayerWeights {
-  const __half* attn_norm = nullptr;   // [hidden]
-  const __half* wq = nullptr;          // [num_heads * head_dim, hidden]
-  const __half* wk = nullptr;          // [num_kv_heads * head_dim, hidden]
-  const __half* wv = nullptr;          // [num_kv_heads * head_dim, hidden]
-  const __half* wo = nullptr;          // [hidden, num_heads * head_dim]
-  const __half* ffn_norm = nullptr;    // [hidden]
-  const __half* gate_proj = nullptr;   // [intermediate, hidden]
-  const __half* up_proj = nullptr;     // [intermediate, hidden]
-  const __half* down_proj = nullptr;   // [hidden, intermediate]
+  const __half* attn_norm = nullptr;  // [hidden]
+  QuantWeight wq;                     // [num_heads * head_dim, hidden]
+  QuantWeight wk;                     // [num_kv_heads * head_dim, hidden]
+  QuantWeight wv;                     // [num_kv_heads * head_dim, hidden]
+  QuantWeight wo;                     // [hidden, num_heads * head_dim]
+  const __half* ffn_norm = nullptr;   // [hidden]
+  QuantWeight gate_proj;              // [intermediate, hidden]
+  QuantWeight up_proj;                // [intermediate, hidden]
+  QuantWeight down_proj;              // [hidden, intermediate]
 };
 
 struct Activations {
@@ -84,7 +95,7 @@ class Model {
 
   const __half* tok_embeddings_ = nullptr;  // [vocab, hidden]
   const __half* output_norm_ = nullptr;     // [hidden]
-  const __half* lm_head_ = nullptr;         // [vocab, hidden]
+  QuantWeight lm_head_;                     // [vocab, hidden]
   std::vector<LayerWeights> layers_;
 
   int q_dim() const { return static_cast<int>(config_.num_heads * config_.head_dim); }
