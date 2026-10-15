@@ -78,6 +78,14 @@ inline DeviceBuffer upload_half(const ModelFile& file, const std::string& name) 
   return buf;
 }
 
+// Upload a tensor's bytes as-is, whatever its dtype (e.g. packed int8/int4 weights).
+inline DeviceBuffer upload_raw(const ModelFile& file, const std::string& name) {
+  const TensorView& t = file.require(name);
+  DeviceBuffer buf(t.nbytes);
+  buf.upload(t.data, t.nbytes);
+  return buf;
+}
+
 inline DeviceBuffer upload_fp32(const ModelFile& file, const std::string& name) {
   const std::vector<float> host = load_fp32(file, name);
   return make_device_buffer(host);

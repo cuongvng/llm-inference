@@ -7,25 +7,7 @@
 
 namespace llm {
 
-// Launch wrappers for every hand-written kernel. One declaration per operator;
-// the kernel itself and its launch configuration live in engine/kernels/*.cu.
-//
-// Conventions across all of these:
-//   * Weights live in VRAM as FP16 (`__half`) exactly as the .llmbin file
-//     stores them, and are converted to FP32 on read inside the consuming
-//     kernel -- never materialized as an FP32 copy in global memory.
-//   * Activations are FP32. This is the naive baseline: it keeps the
-//     accumulate path obvious and makes reference comparisons about kernel
-//     correctness rather than about half-precision rounding. Narrowing
-//     activations is a later, measured change.
-//   * `stream` is a `cudaStream_t` passed as `void*` so this header stays
-//     includable from plain C++ translation units; nullptr means the default
-//     stream.
-//   * Every wrapper checks the launch for errors but does not synchronize --
-//     the caller decides where the pipeline drains.
-
 // Toolchain smoke test: c[i] = a[i] + b[i] over device pointers.
-// Grid-stride loop so the launch config is independent of `n`.
 void launch_vector_add(const float* d_a, const float* d_b, float* d_c, std::size_t n,
                        void* stream = nullptr);
 
@@ -58,6 +40,14 @@ void launch_gemv_fp16(const __half* weight, const float* x, float* y, int n_out,
 // `x` is [m_rows, k_in] and `y` is [m_rows, n_out].
 void launch_gemm_fp16(const __half* weight, const float* x, float* y, int m_rows, int n_out,
                       int k_in, void* stream = nullptr);
+
+// INT8 versions of the two above: weight is int8 [n_out, k_in], scales is FP16
+// [n_out, k_in / group_size], and w = q * scale.
+// Requires k_in % group_size == 0, group_size % 32 == 0, and a 4-byte-aligned weight.
+void launch_gemv_int8(const std::int8_t* weight, const __half* scales, const float* x, float* y,
+                      int n_out, int k_in, int group_size, void* stream = nullptr);
+void launch_gemm_int8(const std::int8_t* weight, const __half* scales, const float* x, float* y,
+                      int m_rows, int n_out, int k_in, int group_size, void* stream = nullptr);
 
 // Appends `n_new` rows of freshly computed K and V into one layer's cache.
 // `new_k` and `new_v` are [n_new, kv_dim]; `k_cache` and `v_cache` are that

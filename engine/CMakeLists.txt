@@ -10,6 +10,8 @@ add_library(llm_engine
   kernels/rope.cu
   kernels/gemv_fp16.cu
   kernels/gemm_fp16.cu
+  kernels/gemv_int8.cu
+  kernels/gemm_int8.cu
   kernels/kv_cache_write.cu
   kernels/attention_qk.cu
   kernels/softmax.cu
@@ -118,6 +120,8 @@ if(LLM_BUILD_REFERENCE_TESTS)
     test_rope:ref_rope.llmbin
     test_gemv_fp16:ref_gemv.llmbin
     test_gemm_fp16:ref_gemm.llmbin
+    test_gemv_int8:ref_gemv_int8.llmbin
+    test_gemm_int8:ref_gemm_int8.llmbin
     test_attention:ref_attention.llmbin
     test_elementwise:ref_elementwise.llmbin
   )
@@ -136,6 +140,7 @@ if(LLM_BUILD_REFERENCE_TESTS)
     COMMAND ${LLM_REFERENCE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/references/reference_forward.py ${LLM_REF_DIR}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/references/reference_forward.py
             ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/binformat.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/convert/quantize.py
     COMMENT "Generating torch reference fixtures from tools/references/reference_forward.py"
   )
   add_custom_target(llm_reference_fixtures DEPENDS ${LLM_REF_OUTPUTS})
