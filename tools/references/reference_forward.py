@@ -4,6 +4,7 @@ Usage:
     python reference_forward.py <out_dir>
 """
 
+import copy
 import pathlib
 import sys
 
@@ -35,6 +36,9 @@ REF_CONFIG = binformat.ModelConfig(
 )
 
 DECODE_STEPS = 200
+
+# The ref model's K is 32 or 64, so the smallest legal group size covers every matmul.
+REF_GROUP = 32
 
 
 # --- fixture plumbing -------------------------------------------------------
@@ -267,6 +271,12 @@ def write_elementwise(path: str) -> None:
 
 # --- whole-model fixture ----------------------------------------------------
 
+LINEAR_NAMES = {
+    "wq": "attn.wq", "wk": "attn.wk", "wv": "attn.wv", "wo": "attn.wo",
+    "gate_proj": "mlp.gate_proj", "up_proj": "mlp.up_proj", "down_proj": "mlp.down_proj",
+}
+
+
 class RefModel:
     """A random Llama-shaped model held as FP16-rounded FP32 tensors.
 
@@ -289,6 +299,7 @@ class RefModel:
         self.tok_embeddings = w(c.vocab_size, c.hidden_size)
         self.output_norm = as_fp16(torch.ones(c.hidden_size) + 0.05 * rand(c.hidden_size))
         self.lm_head = w(c.vocab_size, c.hidden_size)
+        self.int8 = {}  # tensor base name -> (q, scales), filled by quantized_int8()
 
         self.layers = []
         for _ in range(c.num_layers):
@@ -306,21 +317,39 @@ class RefModel:
 
     def write(self, path: str) -> None:
         f = Fixture(self.config)
+
+        def add_linear(base: str, t: torch.Tensor) -> None:
+            if base not in self.int8:
+                return f.add_fp16(base + ".weight", t)
+            q, scales = self.int8[base]
+            f.add_raw(base + ".weight", binformat.DTYPE_INT8, q.shape, q)
+            f.add_raw(base + ".scales", binformat.DTYPE_FP16, scales.shape, scales.astype("<f2"))
+
         f.add_fp16("tok_embeddings.weight", self.tok_embeddings)
         f.add_fp16("output_norm.weight", self.output_norm)
-        f.add_fp16("lm_head.weight", self.lm_head)
+        add_linear("lm_head", self.lm_head)
         for i, layer in enumerate(self.layers):
             p = f"layers.{i}."
             f.add_fp16(p + "attn_norm.weight", layer["attn_norm"])
-            f.add_fp16(p + "attn.wq.weight", layer["wq"])
-            f.add_fp16(p + "attn.wk.weight", layer["wk"])
-            f.add_fp16(p + "attn.wv.weight", layer["wv"])
-            f.add_fp16(p + "attn.wo.weight", layer["wo"])
             f.add_fp16(p + "ffn_norm.weight", layer["ffn_norm"])
-            f.add_fp16(p + "mlp.gate_proj.weight", layer["gate_proj"])
-            f.add_fp16(p + "mlp.up_proj.weight", layer["up_proj"])
-            f.add_fp16(p + "mlp.down_proj.weight", layer["down_proj"])
+            for key, name in LINEAR_NAMES.items():
+                add_linear(p + name, layer[key])
         f.write(path)
+
+    def quantized_int8(self, group: int) -> "RefModel":
+        """A copy whose matmul weights are dequant(quant(W)): what the INT8 engine computes with."""
+        out = copy.deepcopy(self)
+
+        def conv(base: str, t: torch.Tensor) -> torch.Tensor:
+            q, scales = quantize.quantize_int8(t.numpy(), group)
+            out.int8[base] = (q, scales)
+            return torch.from_numpy(quantize.dequantize_int8(q, scales))
+
+        out.lm_head = conv("lm_head", self.lm_head)
+        for i, layer in enumerate(out.layers):
+            for key, name in LINEAR_NAMES.items():
+                layer[key] = conv(f"layers.{i}.{name}", layer[key])
+        return out
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """Full-sequence forward, no cache. Returns logits [T, vocab]."""
@@ -358,11 +387,11 @@ class RefModel:
         return torch.tensor(generated, dtype=torch.float32)
 
 
-def write_forward(model_path: str, ref_path: str) -> None:
-    model = RefModel()
+def write_forward(model_path: str, ref_path: str, model: RefModel = None, prompt=None):
+    model = model or RefModel()
     model.write(model_path)
 
-    prompt = torch.randint(0, REF_CONFIG.vocab_size, (5,))
+    prompt = torch.randint(0, REF_CONFIG.vocab_size, (5,)) if prompt is None else prompt
     logits = model.forward(prompt)
 
     f = Fixture()
@@ -370,6 +399,7 @@ def write_forward(model_path: str, ref_path: str) -> None:
     f.add_fp32("prefill_logits", logits)
     f.add_fp32("generated_ids", model.greedy_decode(prompt, DECODE_STEPS))
     f.write(ref_path)
+    return model, prompt
 
 
 # --- entry point ------------------------------------------------------------
@@ -402,8 +432,13 @@ def main() -> None:
         fn(f"{out_dir}/{name}")
         print(f"wrote {out_dir}/{name}")
 
-    write_forward(f"{out_dir}/ref_model.llmbin", f"{out_dir}/ref_forward.llmbin")
+    model, prompt = write_forward(f"{out_dir}/ref_model.llmbin", f"{out_dir}/ref_forward.llmbin")
     print(f"wrote {out_dir}/ref_model.llmbin, {out_dir}/ref_forward.llmbin")
+
+    # Same model and prompt, INT8 weights: no extra randomness, so the FP16 fixtures above are unchanged.
+    write_forward(f"{out_dir}/ref_model_int8.llmbin", f"{out_dir}/ref_forward_int8.llmbin",
+                  model.quantized_int8(REF_GROUP), prompt)
+    print(f"wrote {out_dir}/ref_model_int8.llmbin, {out_dir}/ref_forward_int8.llmbin")
 
 
 if __name__ == "__main__":

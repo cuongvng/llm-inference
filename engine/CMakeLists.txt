@@ -132,7 +132,8 @@ if(LLM_BUILD_REFERENCE_TESTS)
     list(GET parts 1 fixture_file)
     list(APPEND LLM_REF_OUTPUTS ${LLM_REF_DIR}/${fixture_file})
   endforeach()
-  list(APPEND LLM_REF_OUTPUTS ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin)
+  list(APPEND LLM_REF_OUTPUTS ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin
+                              ${LLM_REF_DIR}/ref_model_int8.llmbin ${LLM_REF_DIR}/ref_forward_int8.llmbin)
 
   add_custom_command(
     OUTPUT ${LLM_REF_OUTPUTS}
@@ -170,6 +171,11 @@ if(LLM_BUILD_REFERENCE_TESTS)
            COMMAND test_forward ${LLM_REF_DIR}/ref_model.llmbin ${LLM_REF_DIR}/ref_forward.llmbin)
   set_tests_properties(test_forward PROPERTIES TIMEOUT 300)
 
+  # Same program on the INT8 copy of the model; the reference ran on its dequantized weights.
+  add_test(NAME test_forward_int8
+           COMMAND test_forward ${LLM_REF_DIR}/ref_model_int8.llmbin ${LLM_REF_DIR}/ref_forward_int8.llmbin)
+  set_tests_properties(test_forward_int8 PROPERTIES TIMEOUT 300)
+
   # Needs no reference outputs -- it compares the engine against itself.
   add_executable(test_kv_cache tests/test_kv_cache.cu)
   target_link_libraries(test_kv_cache PRIVATE llm_engine)
@@ -178,4 +184,6 @@ if(LLM_BUILD_REFERENCE_TESTS)
   set_target_properties(test_kv_cache PROPERTIES CUDA_ARCHITECTURES ${LLM_CUDA_ARCH})
   add_test(NAME test_kv_cache COMMAND test_kv_cache ${LLM_REF_DIR}/ref_model.llmbin)
   set_tests_properties(test_kv_cache PROPERTIES TIMEOUT 300)
+  add_test(NAME test_kv_cache_int8 COMMAND test_kv_cache ${LLM_REF_DIR}/ref_model_int8.llmbin)
+  set_tests_properties(test_kv_cache_int8 PROPERTIES TIMEOUT 300)
 endif()
