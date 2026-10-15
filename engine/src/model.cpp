@@ -144,9 +144,16 @@ Cost matmul_cost(const QuantWeight& w, int m, int n, int k) {
 
 // Decode (one token) is weight-bandwidth bound and goes to the GEMV; prefill reuses weights via the GEMM.
 void matmul(const QuantWeight& w, const float* x, float* y, int m, int n, int k) {
-  if (w.dtype != DType::kFP16) {
-    fail(std::string("no matmul kernel for ") + (w.dtype == DType::kINT8 ? "INT8" : "INT4") + " weights yet");
+  if (w.dtype == DType::kINT8) {
+    const auto* q = static_cast<const std::int8_t*>(w.data);
+    if (m == 1) {
+      launch_gemv_int8(q, w.scales, x, y, n, k, w.group_size);
+    } else {
+      launch_gemm_int8(q, w.scales, x, y, m, n, k, w.group_size);
+    }
+    return;
   }
+  if (w.dtype != DType::kFP16) fail("no matmul kernel for INT4 weights yet");
   if (m == 1) {
     launch_gemv_fp16(w.fp16(), x, y, n, k);
   } else {
