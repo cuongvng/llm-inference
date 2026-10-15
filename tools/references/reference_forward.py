@@ -15,6 +15,7 @@ import torch.nn.functional as F
 # script is a consumer of the format, not part of its definition.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "convert"))
 import binformat  # noqa: E402
+import quantize  # noqa: E402
 
 SEED = 20240501
 
@@ -62,6 +63,9 @@ class Fixture:
 
     def add_fp16(self, name: str, t: torch.Tensor) -> None:
         self.writer.add_tensor(name, binformat.DTYPE_FP16, tuple(t.shape), fp16(t))
+
+    def add_raw(self, name: str, dtype: int, shape, data: np.ndarray) -> None:
+        self.writer.add_tensor(name, dtype, tuple(shape), np.ascontiguousarray(data).tobytes())
 
     def write(self, path: str) -> None:
         self.writer.write(path)
@@ -184,6 +188,45 @@ def write_gemm(path: str) -> None:
     f.add_fp16("weight", weight)
     f.add_fp32("input", x)
     f.add_fp32("expected", x @ weight.t())
+    f.write(path)
+
+
+# (group size, K): G=32 spans several groups per warp step, G=128 is the production size.
+INT8_CASES = [(32, 320), (128, 384)]
+QUANT_SEED = 7
+
+
+def add_int8_case(f: Fixture, prefix: str, rng, n_out: int, k_in: int, group: int) -> np.ndarray:
+    """Adds an int8 weight + scales; returns the dequantized weight the kernel should see."""
+    w = rng.standard_normal((n_out, k_in)).astype(np.float16).astype(np.float32)
+    w[3] = 0.0  # all-zero groups: scale 0 must give exactly 0
+    q, scales = quantize.quantize_int8(w, group)
+    f.add_raw(prefix + "weight", binformat.DTYPE_INT8, q.shape, q)
+    f.add_raw(prefix + "scales", binformat.DTYPE_FP16, scales.shape, scales.astype("<f2"))
+    return quantize.dequantize_int8(q, scales)
+
+
+def write_gemv_int8(path: str) -> None:
+    rng = np.random.default_rng(QUANT_SEED)
+    f = Fixture()
+    for group, k_in in INT8_CASES:
+        p = f"g{group}."
+        w = torch.from_numpy(add_int8_case(f, p, rng, 130, k_in, group))
+        x = torch.from_numpy(rng.standard_normal(k_in).astype(np.float32))
+        f.add_fp32(p + "input", x)
+        f.add_fp32(p + "expected", w @ x)
+    f.write(path)
+
+
+def write_gemm_int8(path: str) -> None:
+    rng = np.random.default_rng(QUANT_SEED + 1)
+    f = Fixture()
+    for group, k_in in INT8_CASES:
+        p = f"g{group}."
+        w = torch.from_numpy(add_int8_case(f, p, rng, 130, k_in, group))
+        x = torch.from_numpy(rng.standard_normal((6, k_in)).astype(np.float32))
+        f.add_fp32(p + "input", x)
+        f.add_fp32(p + "expected", x @ w.t())
     f.write(path)
 
 
@@ -339,6 +382,9 @@ FIXTURES = {
     "ref_gemm.llmbin": write_gemm,
     "ref_attention.llmbin": write_attention,
     "ref_elementwise.llmbin": write_elementwise,
+    # Own numpy seed, so adding these does not shift the torch stream above.
+    "ref_gemv_int8.llmbin": write_gemv_int8,
+    "ref_gemm_int8.llmbin": write_gemm_int8,
 }
 
 

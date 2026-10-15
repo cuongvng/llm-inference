@@ -1,12 +1,6 @@
-"""HuggingFace checkpoint -> .llmbin (docs/binary_format.md).
-
-Dev-time only -- needs torch/transformers/safetensors (tools/convert/requirements.txt),
-none of which are runtime dependencies of the C++ engine. With --quant int8/int4 the matmul weights (7 per layer + lm_head) are quantized group-wise
-by quantize.py; embeddings and norms always stay FP16.
-
+"""HuggingFace checkpoint -> .llmbin.
 Targets Llama-architecture checkpoints (TinyLlama-1.1B and compatible): RoPE,
-RMSNorm, GQA, SwiGLU. Tensor names in the output file match what
-engine/src/model.cpp expects to find via ModelFile::find().
+RMSNorm, GQA, SwiGLU.
 
 Usage:
     python convert_weights.py --model <hf-repo-or-local-dir> --out model.llmbin \\
